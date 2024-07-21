@@ -7,6 +7,7 @@
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/pkt_cls.h>
 
 #define MIDDLEWARE_PORT 4444
 #define MAX_TCP_SIZE 1480 // TODO: find a more precise number
@@ -16,6 +17,7 @@
 enum {
   PROG_XDP_PARSE_HEADERS = 0,
   PROG_XDP_REDIRECT_PACKET,
+  PROG_CLS_BLOCK_FINS,
 
   MAX_NUM_OF_PROGRAMS
 };
@@ -83,6 +85,9 @@ struct connection_parameters {
   unsigned int base_sequence_number;
   unsigned int base_ack_number;
   struct tcp_timestamps_option timestamps;
+
+  int seen_fin;
+  int tc_ack_counter;
 
   // counter
   int packet_counter;
@@ -249,6 +254,9 @@ struct tcp_timestamps_ctx {
 
   struct tcp_timestamps_option* extracted_timestamps;
   struct tcp_timestamps_option* new_timestamps;
+
+  // 1 if we only need to increment the current timestamps
+  int increment_timestamps;
 };
 
 /**
@@ -323,6 +331,9 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
   if (ctx->new_timestamps != NULL) {
     *tsval = ctx->extracted_timestamps->tsecr;
     *tsecr = ctx->new_timestamps->tsecr;
+  } else if (ctx->increment_timestamps) {
+    *tsval = ctx->extracted_timestamps->tsecr + 1;
+    *tsecr = ctx->extracted_timestamps->tsval;
   }
 
   return 1;
@@ -334,11 +345,10 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
  *
  * Inspired by the Linux kernel
  */
-static int
-fast_extract_and_update_tcp_timestamps_option(void* data, void* data_end, __u16 tcp_start,
-                                              int tcp_hdr_size,
-                                              struct tcp_timestamps_option* extracted_timestamps,
-                                              struct tcp_timestamps_option* new_timestamps) {
+static int fast_extract_and_update_tcp_timestamps_option(
+    void* data, void* data_end, __u16 tcp_start, int tcp_hdr_size,
+    struct tcp_timestamps_option* extracted_timestamps,
+    struct tcp_timestamps_option* new_timestamps, int increment_timestamps) {
   __u16 tcp_options_start_offset = (tcp_start + sizeof(struct tcphdr)) & 0x7FFF;
 
   unsigned char* noop1 = data + tcp_options_start_offset;
@@ -375,6 +385,9 @@ fast_extract_and_update_tcp_timestamps_option(void* data, void* data_end, __u16 
   if (new_timestamps != NULL) {
     *tsval = extracted_timestamps->tsecr;
     *tsecr = new_timestamps->tsecr;
+  } else if (increment_timestamps) {
+    *tsval = extracted_timestamps->tsecr + 1;
+    *tsecr = extracted_timestamps->tsval;
   }
 
   return 0;
@@ -384,16 +397,16 @@ fast_extract_and_update_tcp_timestamps_option(void* data, void* data_end, __u16 
  * Extract the TCP timestamps and put them in extracted_timestamps; if new_timestamps is not NULL,
  * also update them
  */
-static int
-extract_and_update_tcp_timestamps_option(void* data, void* data_end, __u16 tcp_start,
-                                         int tcp_hdr_size,
-                                         struct tcp_timestamps_option* extracted_timestamps,
-                                         struct tcp_timestamps_option* new_timestamps) {
+static int extract_and_update_tcp_timestamps_option(
+    void* data, void* data_end, __u16 tcp_start, int tcp_hdr_size,
+    struct tcp_timestamps_option* extracted_timestamps,
+    struct tcp_timestamps_option* new_timestamps, int increment_timestamps) {
   int err = 0;
 
   // try doing it without the bpf_loop
   err = fast_extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
-                                                      extracted_timestamps, new_timestamps);
+                                                      extracted_timestamps, new_timestamps,
+                                                      increment_timestamps);
   if (err == 0) {
     return 0;
   }
@@ -409,7 +422,9 @@ extract_and_update_tcp_timestamps_option(void* data, void* data_end, __u16 tcp_s
                                         .skip = 0,
 
                                         .extracted_timestamps = extracted_timestamps,
-                                        .new_timestamps = new_timestamps};
+                                        .new_timestamps = new_timestamps,
+
+                                        .increment_timestamps = increment_timestamps};
 
   int nr = bpf_loop(tcp_hdr_size, (void*)extract_and_update_tcp_timestamps_loop, &loop_ctx, 0);
   if (nr < 0) {
@@ -527,7 +542,7 @@ static __always_inline int add_new_connection(void* data, void* data_end, __u16 
 
   // extract the timestamps
   err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
-                                                 &(params.timestamps), NULL);
+                                                 &(params.timestamps), NULL, 0);
   if (err < 0) {
     return err;
   }
@@ -608,7 +623,7 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
                                                  .tsecr = params->timestamps.tsval};
 
   err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
-                                                 extracted_timestamps, &new_timestamps);
+                                                 extracted_timestamps, &new_timestamps, 0);
   if (err < 0) {
     // bpf_printk("Error while updating the TCP Timestamps option");
     return err;
@@ -676,11 +691,19 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
     return err;
   }
 
-  // if this packet is a FIN, delete the connection but still send the packet
   if (tcp->fin) {
+    params->seen_fin = 1;
+  }
+
+  // if we have seen both FINs, this is the last ACK, delete the map entries
+  if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin) {
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &connection);
     if (err < 0) {
       // bpf_printk("Error while deleting the connection");
+    }
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &other_conn);
+    if (err < 0) {
+      // bpf_printk("Error while deleting the other connection");
     }
   }
 
@@ -729,6 +752,8 @@ int redirect_packet_main(struct xdp_md* ctx) {
     connection.port = bpf_ntohs(tcp->dest);
   }
 
+  // bpf_printk("IP: %u, Port: %u", connection.ip, connection.port);
+
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
 
@@ -759,10 +784,183 @@ int redirect_packet_main(struct xdp_md* ctx) {
   // TODO: make the ifindex programmable
   return bpf_redirect(3, 0);
 
+  // TODO: return DROP on error?
 pass:
   // bpf_printk("Passing");
   // bpf_printk("");
   return XDP_PASS;
+}
+
+/* BLOCK FINS */
+
+/**
+ * Redirect the FIN to the interface by swapping MACs, IPs, ports, updating timestamps and checksums
+ */
+static __always_inline int reply_fin_back(void* data, void* data_end, __u16 tcp_start,
+                                          int tcp_hdr_size, struct ethhdr* eth, struct iphdr* ip,
+                                          struct tcphdr* tcp) {
+  // swap MACs
+  unsigned char temp_mac[ETH_ALEN];
+  __builtin_memcpy(temp_mac, eth->h_source, ETH_ALEN);
+  __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+  __builtin_memcpy(eth->h_dest, temp_mac, ETH_ALEN);
+
+  // swap IPs
+  unsigned int temp_ip;
+  temp_ip = ip->saddr;
+  ip->saddr = ip->daddr;
+  ip->daddr = temp_ip;
+
+  // swap ports
+  unsigned int temp_port;
+  temp_port = tcp->source;
+  tcp->source = tcp->dest;
+  tcp->dest = temp_port;
+
+  // swap seq & ack, while incrementing
+  unsigned int temp_seq;
+  temp_seq = tcp->seq;
+
+  tcp->seq = tcp->ack_seq;
+  tcp->ack_seq = bpf_ntohl(bpf_ntohl(temp_seq) + 1);
+
+  // make sure that the reply is a FIN/ACK
+  tcp->ack = 1;
+
+  // swap timestamps, while incrementing
+  struct tcp_timestamps_option timestamps;
+  extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size, &timestamps,
+                                           NULL, 1);
+
+  // update checksum
+  update_ip_checksum(ip);
+  update_tcp_checksum(data, data_end, ip, tcp);
+
+  // TODO: make the ifindex programmable
+  return bpf_redirect(3, BPF_F_INGRESS);
+}
+
+/**
+ * Drop the last ACK, using the connection parameters set by XDP
+ */
+static __always_inline int block_last_ack(struct iphdr* ip, struct tcphdr* tcp) {
+  // get connection type
+  struct connection_fingerprint connection;
+
+  if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
+    // bpf_printk("Message to Client");
+    connection.ip = ip->daddr;
+    connection.port = bpf_htons(tcp->dest);
+  } else {
+    // bpf_printk("Message to Server");
+    connection.ip = ip->daddr;
+    connection.port = bpf_ntohs(tcp->source);
+  }
+
+  // bpf_printk("IP: %u, Port: %u", connection.ip, connection.port);
+
+  // get the parameters of the connection
+  struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
+      &connection_fingerprint_to_connection_parameters_map, &connection);
+
+  if (params == NULL) {
+    // bpf_printk("Error");
+    // bpf_printk("");
+    return -1;
+  }
+
+  params->tc_ack_counter += 1;
+  if (params->tc_ack_counter == 1) {
+    return -1;
+  }
+
+  return 0;
+}
+
+/**
+ * Block all FINs on egress from exiting; instead, reply to them with fake FINs and drop the last
+ * ACK
+ *
+ * TODO: create a separate function to do parsing and delete the first XDP program
+ */
+SEC("cls/block_fins")
+int block_fins_main(struct __sk_buff* skb) {
+  int err;
+
+  __u16 nf_off = 0;
+  int hdr_size;
+
+  struct ethhdr* eth;
+  __u16 eth_type;
+
+  struct iphdr* ip;
+  int ip_protocol;
+
+  struct tcphdr* tcp;
+
+  void* data = (void*)(unsigned long long)skb->data;
+  void* data_end = (void*)(unsigned long long)skb->data_end;
+
+  /* LAYER 2: ETHERNET */
+
+  eth_type = parse_ethhdr(data, data_end, &nf_off, &eth);
+
+  if (data + sizeof(struct ethhdr) > data_end) {
+    // bpf_printk("Packet is not a valid Ethernet packet, dropping it");
+    goto pass;
+  }
+
+  /* LAYER 3: IP */
+
+  if (eth_type != bpf_ntohs(ETH_P_IP)) {
+    // bpf_printk("Packet is not IPv4, passing it");
+    goto pass;
+  }
+
+  hdr_size = parse_iphdr(data, data_end, &nf_off, &ip);
+  if (hdr_size < 0) {
+    // bpf_printk("Packet is not a valid IPv4 packet, dropping it");
+    goto pass;
+  }
+
+  /* LAYER 4: TCP */
+
+  if (ip->protocol != IPPROTO_TCP) {
+    // bpf_printk("Packet is not TCP, passing it");
+    goto pass;
+  }
+
+  __u16 tcp_start = nf_off;
+
+  hdr_size = parse_tcphdr(data, data_end, &nf_off, &tcp);
+  if (hdr_size < 0) {
+    // bpf_printk("Packet is not a valid TCP packet, dropping it");
+    goto pass;
+  }
+
+  // reply with a fake FIN
+  if (tcp->fin) {
+    // bpf_printk("Redirecting");
+    // bpf_printk("");
+    return reply_fin_back(data, data_end, tcp_start, hdr_size, eth, ip, tcp);
+  }
+
+  // we need to block the last single ACK
+  if (tcp->ack && !tcp->syn && !tcp->psh) {
+    err = block_last_ack(ip, tcp);
+    if (err < 0) {
+      goto pass;
+    }
+
+    // bpf_printk("Dropping");
+    // bpf_printk("");
+    return TC_ACT_SHOT;
+  }
+
+pass:
+  // bpf_printk("Passing");
+  // bpf_printk("");
+  return TC_ACT_OK;
 }
 
 char LICENSE[] SEC("license") = "GPL";

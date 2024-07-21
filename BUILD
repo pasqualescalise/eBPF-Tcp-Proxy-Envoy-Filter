@@ -21,7 +21,6 @@ genrule(
 	name = "ebpf_object",
 	outs = ["ebpf/ebpf_tcp_proxy.bpf.o"],
 
-	# $(location)
 	srcs = ["ebpf/ebpf_tcp_proxy.bpf.c"],
 
     cmd = """
@@ -34,19 +33,18 @@ genrule(
 	name = "ebpf_skeleton",
 	outs = ["ebpf_tcp_proxy.skel.h"],
 
-	# TODO: use $(location)
 	srcs = ["ebpf/ebpf_tcp_proxy.bpf.o"],
 
 	# XXX: this sed hack is needed to change C casts to the C++ ones
     cmd = """
-    bpftool gen skeleton $< | sed -e "s/\\(= \\)(\\([^)]*\\))\\(.*\\);/\\1static_cast<\\2>(\\3);/" -e "s/\\(return \\)(\\([^)]*\\))\\(.*\\)/\\1static_cast<\\2>(\\3/" -e "s/static_cast<void \\*>/const_cast<void \\*>/" | sed -z -e 's/";\\n}/\\");\\n}/' > $@
+	bpftool gen skeleton $< | sed -e "s/\\(= \\)(\\([^)]*\\))\\(.*\\);/\\1static_cast<\\2>(\\3);/" -e "s/\\(return \\)(\\([^)]*\\))\\(.*\\)/\\1static_cast<\\2>(\\3/" -e "s/static_cast<void \\*>/const_cast<void \\*>/" -e "s/static_cast<void \\*\\*>/reinterpret_cast<void **>/" | sed -z -e 's/";\\n}/\\");\\n}/' > $@
     """,
 )
 
 envoy_cc_library(
     name = "ebpf_tcp_proxy_lib",
     srcs = ["ebpf_tcp_proxy.cc"],
-    hdrs = ["ebpf_tcp_proxy.h", "ebpf_tcp_proxy.skel.h"],
+    hdrs = ["ebpf_tcp_proxy.h"],
     repository = "@envoy",
     deps = [
         "@envoy//envoy/buffer:buffer_interface",
@@ -61,6 +59,7 @@ envoy_cc_library(
 envoy_cc_library(
     name = "ebpf_tcp_proxy_config",
     srcs = ["ebpf_tcp_proxy_config.cc"],
+    hdrs = ["ebpf_tcp_proxy.h", "ebpf_tcp_proxy_config.h", "ebpf_tcp_proxy.skel.h"],
     repository = "@envoy",
     deps = [
         ":ebpf_tcp_proxy_lib",

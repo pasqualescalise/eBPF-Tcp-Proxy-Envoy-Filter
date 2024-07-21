@@ -1,14 +1,7 @@
-#include "ebpf_tcp_proxy.h"
+#include "ebpf_tcp_proxy_config.h"
 
 #include <linux/if_link.h>
-
-#include "envoy/registry/registry.h"
-#include "envoy/server/filter_config.h"
-
-#include "source/extensions/filters/network/tcp_proxy/config.h"
-
-#include "envoy/extensions/filters/network/tcp_proxy/v3/ebpf_tcp_proxy.pb.h"
-#include "envoy/extensions/filters/network/tcp_proxy/v3/ebpf_tcp_proxy.pb.validate.h"
+#include <linux/pkt_cls.h>
 
 namespace Envoy {
 namespace Extensions {
@@ -16,145 +9,199 @@ namespace NetworkFilters {
 namespace TcpProxy {
 namespace EbpfTcpProxy {
 
-class EbpfLoader {
-public:
-  static int LoadeBPFPrograms(int interface_index) {
-    struct bpf_object_skeleton* skel = NULL;
-    int err;
+/**
+ * Load and attach the eBPF programs
+ */
+bool EbpfLoader::loadeBPFPrograms(int interface_index,
+                                  int* connection_fingerprint_to_connection_fingerprint_map_fd) {
+  struct bpf_object_skeleton* skel = NULL;
 
-    // description of all the programs
-    ProgramDescription progs[] = {
-        {"xdp/parse_headers", BPF_PROG_TYPE_XDP, PROG_XDP_PARSE_HEADERS, NULL},
-        {"xdp/redirect_packet", BPF_PROG_TYPE_XDP, PROG_XDP_REDIRECT_PACKET, NULL},
-    };
+  // open eBPF application
+  struct ebpf_tcp_proxy_bpf* obj = ebpf_tcp_proxy_bpf__open();
+  if (!obj) {
+    ENVOY_LOG_MISC(error, "Error while opening eBPF skeleton");
+    return false;
+  }
 
-    // open eBPF application
-    struct ebpf_tcp_proxy_bpf* obj = ebpf_tcp_proxy_bpf__open();
-    if (!obj) {
-      ENVOY_LOG_MISC(error, "Error while opening eBPF skeleton");
+  skel = obj->skeleton;
+
+  // set program types
+  for (int i = 0; i < skel->prog_cnt; i++) {
+    bpf_program__set_type(*(skel->progs[i].prog), progs[i].type);
+  }
+
+  // load and verify eBPF programs
+  if (ebpf_tcp_proxy_bpf__load(obj)) {
+    ENVOY_LOG_MISC(error, "Error while loading eBPF program");
+    return false;
+  }
+
+  if (!attachXDP(skel, bpf_map__fd(obj->maps.programs_map), interface_index)) {
+    ENVOY_LOG_MISC(error, "Error while attaching XDP programs");
+    return false;
+  }
+
+  if (!attachTC(skel, interface_index)) {
+    ENVOY_LOG_MISC(error, "Error while attaching TC programs");
+    return false;
+  }
+
+  // get the map file descriptor from the eBPF object
+  *connection_fingerprint_to_connection_fingerprint_map_fd =
+      bpf_map__fd(obj->maps.connection_fingerprint_to_connection_fingerprint_map);
+
+  ENVOY_LOG_MISC(trace, "Successfully attached!");
+
+  return true;
+}
+
+/**
+ * Attach the first XDP program to the interface; also set up the program map to allow tail calls
+ */
+bool EbpfLoader::attachXDP(struct bpf_object_skeleton* skel, int programs_map_fd,
+                           int interface_index) {
+  int err;
+
+  // put the XDP programs in the programs map
+  int xdp_index = 0;
+  for (int i = 0; i < skel->prog_cnt; i++) {
+    if (progs[i].type != BPF_PROG_TYPE_XDP) {
+      continue;
     }
 
-    skel = obj->skeleton;
-    struct bpf_prog_skeleton* skeleton_programs = skel->progs;
+    int prog_fd = bpf_program__fd(*(skel->progs[i].prog));
 
-    // set program types
-    for (int i = 0; i < skel->prog_cnt; i++) {
-      bpf_program__set_type(*(skeleton_programs[i].prog), progs[i].type);
-    }
-
-    // load and verify eBPF programs
-    if (ebpf_tcp_proxy_bpf__load(obj)) {
-      ENVOY_LOG_MISC(error, "Error while loading eBPF program");
-    }
-
-    // put the XDP programs in the programs map
-    int programs_map_fd = bpf_map__fd(obj->maps.programs_map);
-
-    int xdp_index = 0;
-    for (int i = 0; i < skel->prog_cnt; i++) {
-      if (progs[i].type != BPF_PROG_TYPE_XDP) {
-        continue;
-      }
-
-      int prog_fd = bpf_program__fd(*(skeleton_programs[i].prog));
-
-      err = bpf_map_update_elem(programs_map_fd, &xdp_index, &prog_fd, BPF_ANY);
-      if (err) {
-        ENVOY_LOG_MISC(error, "Error while adding eBPF program to map");
-      }
-
-      xdp_index++;
-    }
-
-    // attach the first XDP program to the interface
-    err = bpf_xdp_attach(interface_index,
-                         bpf_program__fd(*(skeleton_programs[PROG_XDP_PARSE_HEADERS].prog)),
-                         XDP_FLAGS_DRV_MODE, NULL);
+    err = bpf_map_update_elem(programs_map_fd, &xdp_index, &prog_fd, BPF_ANY);
     if (err) {
-      ENVOY_LOG_MISC(error, "Error while attaching the XDP program to the interface");
+      ENVOY_LOG_MISC(error, "Error while adding eBPF program to map");
+      return false;
     }
 
-    // get the map file descriptor from the eBPF object
-    int connection_fingerprint_to_connection_fingerprint_map_fd =
-        bpf_map__fd(obj->maps.connection_fingerprint_to_connection_fingerprint_map);
-
-    ENVOY_LOG_MISC(trace, "Successfully attached!");
-
-    return connection_fingerprint_to_connection_fingerprint_map_fd;
+    xdp_index++;
   }
 
-private:
-  // Program indexes
-  enum {
-    PROG_XDP_PARSE_HEADERS = 0,
-    PROG_XDP_REDIRECT_PACKET,
+  // attach the first XDP program to the interface
+  err =
+      bpf_xdp_attach(interface_index, bpf_program__fd(*(skel->progs[PROG_XDP_PARSE_HEADERS].prog)),
+                     XDP_FLAGS_DRV_MODE, NULL);
+  if (err) {
+    ENVOY_LOG_MISC(error, "Error while attaching the XDP program to the interface");
+    return false;
+  }
 
-    MAX_NUM_OF_PROGRAMS
-  };
-
-  struct ProgramDescription {
-    char name[256];
-    enum bpf_prog_type type;
-    int map_prog_idx;
-    struct bpf_program* prog;
-  };
-};
+  return true;
+}
 
 /**
- * Config registration for the EbpfTcpProxy filter
+ * Attach the "BLOCK FINS" TC program defined in the eBPF skeleton
+ *
+ * TODO: rewrite this using bpf_links, need to upgrade libbpf and bpftool
  */
-class EbpfTcpProxyConfigFactory
-    : public Common::FactoryBase<envoy::extensions::filters::network::tcp_proxy::v3::EbpfTcpProxy> {
-public:
-  EbpfTcpProxyConfigFactory() : FactoryBase("ebpf_tcp_proxy", true){};
+bool EbpfLoader::attachTC(struct bpf_object_skeleton* skel, int interface_index) {
+  int err;
 
-  std::string name() const override { return "ebpf_tcp_proxy"; }
+  // attach to the egress since it has to block FINs generated by Envoy
+  LIBBPF_OPTS(bpf_tc_hook, hook, .attach_point = BPF_TC_EGRESS);
+  LIBBPF_OPTS(bpf_tc_opts, tc_options);
 
-  std::set<std::string> configTypes() override {
-    return {"envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxy"};
+  int tc_fd = bpf_program__fd(*(skel->progs[PROG_CLS_BLOCK_FINS].prog));
+  if (tc_fd < 0) {
+    ENVOY_LOG_MISC(error, "Error while looking for the TC program");
+    return false;
   }
 
-private:
-  int connection_fingerprint_to_connection_fingerprint_map_fd;
+  tc_options.prog_fd = tc_fd;
+  hook.ifindex = interface_index;
 
-  /**
-   * Construct a EbpfTcpProxy using a TcpProxy configuration
-   */
-  Network::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy& proto_config,
-      Server::Configuration::FactoryContext& context) {
-    ASSERT(!proto_config.stat_prefix().empty());
-
-    Envoy::TcpProxy::ConfigSharedPtr filter_config(
-        std::make_shared<Envoy::TcpProxy::Config>(proto_config, context));
-    return [filter_config, &context, this](Network::FilterManager& filter_manager) -> void {
-      filter_manager.addReadFilter(std::make_shared<Envoy::TcpProxy::EbpfTcpProxy::EbpfTcpProxy>(
-          filter_config, context.serverFactoryContext().clusterManager(),
-          connection_fingerprint_to_connection_fingerprint_map_fd));
-    };
+  err = bpf_tc_hook_create(&hook);
+  if (err == -EEXIST) {
+    ENVOY_LOG_MISC(trace, "The TC hook already existed, continue");
+  } else if (err) {
+    ENVOY_LOG_MISC(error, "Failed to create TC hook");
+    return false;
   }
 
-  /**
-   * Load the eBPF programs, extract the TcpProxy configuration from the EbpfTcpProxy
-   * one, then instantiate the filter
-   */
-  Network::FilterFactoryCb createFilterFactoryFromProtoTyped(
-      const envoy::extensions::filters::network::tcp_proxy::v3::EbpfTcpProxy& proto_config,
-      Server::Configuration::FactoryContext& context) {
-    // load the eBPF program and get the map descriptor
-    connection_fingerprint_to_connection_fingerprint_map_fd =
-        EbpfLoader::LoadeBPFPrograms(proto_config.interface_index());
+  tc_options.flags = BPF_TC_F_REPLACE;
+  hook.attach_point = BPF_TC_EGRESS;
 
-    // construct the EbpfTcpProxy filter using a TcpProxy configuration
-    return EbpfTcpProxyConfigFactory::createFilterFactoryFromProtoTyped(proto_config.tcp_proxy(),
-                                                                        context);
+  err = bpf_tc_attach(&hook, &tc_options);
+  if (err) {
+    ENVOY_LOG_MISC(error, "Failed to attach TC program to interface");
+    return false;
   }
-};
+
+  return true;
+}
 
 /**
- * Static registration for the EbpfTcpProxy filter
+ * Unload and detach the eBPF programs
  */
-REGISTER_FACTORY(EbpfTcpProxyConfigFactory, Server::Configuration::NamedNetworkFilterConfigFactory);
+bool EbpfLoader::unloadeBPFPrograms(int interface_index) {
+  return detachXDP(interface_index) && detachTC();
+}
+
+/**
+ * Find all the XDP programs and detach them from the interface
+ */
+bool EbpfLoader::detachXDP(int interface_index) {
+  __u32 curr_prog_id = 0;
+
+  if (!bpf_xdp_query_id(interface_index, XDP_FLAGS_DRV_MODE, &curr_prog_id)) {
+    if (curr_prog_id) {
+      bpf_xdp_detach(interface_index, XDP_FLAGS_DRV_MODE, NULL);
+      ENVOY_LOG_MISC(trace, "Detached XDP program from interface");
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Detach the TC program and delete the qdisc
+ *
+ * TODO: still not implemented
+ */
+bool EbpfLoader::detachTC() { return true; }
+
+/**
+ * Construct a EbpfTcpProxy using a TcpProxy configuration
+ */
+Network::FilterFactoryCb EbpfTcpProxyConfigFactory::createFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy& proto_config,
+    Server::Configuration::FactoryContext& context) {
+  ASSERT(!proto_config.stat_prefix().empty());
+
+  Envoy::TcpProxy::ConfigSharedPtr filter_config(
+      std::make_shared<Envoy::TcpProxy::Config>(proto_config, context));
+  return [filter_config, &context, this](Network::FilterManager& filter_manager) -> void {
+    filter_manager.addReadFilter(std::make_shared<Envoy::TcpProxy::EbpfTcpProxy::EbpfTcpProxy>(
+        filter_config, context.serverFactoryContext().clusterManager(),
+        connection_fingerprint_to_connection_fingerprint_map_fd));
+  };
+}
+
+/**
+ * Load the eBPF programs, extract the TcpProxy configuration from the EbpfTcpProxy
+ * one, then instantiate the filter
+ */
+Network::FilterFactoryCb EbpfTcpProxyConfigFactory::createFilterFactoryFromProtoTyped(
+    const envoy::extensions::filters::network::tcp_proxy::v3::EbpfTcpProxy& proto_config,
+    Server::Configuration::FactoryContext& context) {
+  interface_index = proto_config.interface_index();
+
+  // load the eBPF program and get the map descriptor
+  if (!EbpfLoader::loadeBPFPrograms(interface_index,
+                                    &connection_fingerprint_to_connection_fingerprint_map_fd)) {
+    std::cout << "FAILED" << std::endl;
+    // TODO: use exceptions
+    return NULL;
+  }
+
+  // construct the EbpfTcpProxy filter using a TcpProxy configuration
+  return EbpfTcpProxyConfigFactory::createFilterFactoryFromProtoTyped(proto_config.tcp_proxy(),
+                                                                      context);
+}
 
 } // namespace EbpfTcpProxy
 } // namespace TcpProxy

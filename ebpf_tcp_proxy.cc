@@ -17,14 +17,8 @@ Network::FilterStatus EbpfTcpProxy::onData(Buffer::Instance& data, bool end_stre
   getStreamInfo().getDownstreamBytesMeter()->addWireBytesReceived(data.length());
   if (upstream_) {
     getStreamInfo().getUpstreamBytesMeter()->addWireBytesSent(data.length());
-    // send the TLS Client Hello
-    upstream_->encodeData(data, end_stream);
-
-    // after sending the TLS Client Hello, wait for the connection to end then close the sockets
-    upstream_->addBytesSentCallback([&](uint64_t) -> bool {
-      waitUntilClosedConnection();
-      return false;
-    });
+    // send the TLS Client Hello and close the connection
+    upstream_->encodeData(data, true);
   }
 
   ASSERT(0 == data.length());
@@ -33,37 +27,6 @@ Network::FilterStatus EbpfTcpProxy::onData(Buffer::Instance& data, bool end_stre
 
   resetIdleTimer();
   return Network::FilterStatus::StopIteration;
-}
-
-/**
- * Wait until the connection have ended and destroy the threads
- *
- * XXX: this implementation can be improved greatly
- */
-void EbpfTcpProxy::waitUntilClosedConnection() {
-  ConnectionFingerprint client_fingerprint_lookup, server_fingerprint_lookup;
-
-  while (1) {
-    // look for the Client connection
-    int err = bpf_map_lookup_elem(connection_fingerprint_to_connection_fingerprint_map_fd,
-                                  &client_fingerprint, &server_fingerprint_lookup);
-    if (err < 0) {
-      ENVOY_CONN_LOG(trace, "Client connection ended", read_callbacks_->connection());
-      break;
-    }
-
-    // look for the Server connection
-    err = bpf_map_lookup_elem(connection_fingerprint_to_connection_fingerprint_map_fd,
-                              &server_fingerprint, &client_fingerprint_lookup);
-    if (err < 0) {
-      ENVOY_CONN_LOG(trace, "Server connection ended", read_callbacks_->connection());
-      break;
-    }
-  }
-
-  read_callbacks_->connection().close(Network::ConnectionCloseType::Abort,
-                                      "EbpfTcpProxyDownstream");
-  ENVOY_CONN_LOG(trace, "Closing", read_callbacks_->connection());
 }
 
 /**

@@ -1,13 +1,12 @@
 #pragma once
 
+#include <bpf/bpf.h>
+
 #include "envoy/network/filter.h"
 
 #include "source/common/common/logger.h"
 
 #include "source/common/tcp_proxy/tcp_proxy.h"
-
-#include <bpf/bpf.h>
-#include "ebpf_tcp_proxy.skel.h"
 
 namespace Envoy {
 namespace TcpProxy {
@@ -36,7 +35,6 @@ private:
   int connection_fingerprint_to_connection_fingerprint_map_fd;
 
   void bindClientAndServerConnections();
-  void waitUntilClosedConnection();
 };
 
 } // namespace EbpfTcpProxy
