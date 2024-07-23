@@ -21,10 +21,10 @@ namespace EbpfTcpProxy {
  */
 class EbpfLoader {
 public:
-  static bool loadeBPFPrograms(int interface_index,
+  static void loadeBPFPrograms(int interface_index,
                                int* connection_fingerprint_to_connection_fingerprint_map_fd);
 
-  static bool unloadeBPFPrograms(int interface_index);
+  static void unloadeBPFPrograms(int interface_index);
 
 private:
   // program indexes
@@ -50,11 +50,28 @@ private:
       {"cls/block_fins", BPF_PROG_TYPE_SCHED_CLS, PROG_CLS_BLOCK_FINS, NULL},
   };
 
-  static bool attachXDP(struct bpf_object_skeleton* skel, int programs_map_fd, int interface_index);
-  static bool attachTC(struct bpf_object_skeleton* skel, int interface_index);
+  // even if multiple filters are configured, just load the programs once
+  // XXX: we assume only one interface wants to be configured
+  static bool ebpf_loaded;
 
-  static bool detachXDP(int interface_index);
-  static bool detachTC();
+  static void attachXDP(struct bpf_object_skeleton* skel, int programs_map_fd, int interface_index);
+  static void attachTC(struct bpf_object_skeleton* skel, int interface_index);
+
+  static void detachXDP(int interface_index);
+  static void detachTC();
+};
+
+/**
+ * Throwed by the EbpfLoader methods
+ */
+class eBPFLoadException : public std::exception {
+public:
+  eBPFLoadException(std::string message_) : message(message_){};
+
+  const char* what() const throw() { return message.c_str(); }
+
+private:
+  std::string message;
 };
 
 /**
@@ -65,7 +82,13 @@ class EbpfTcpProxyConfigFactory
 public:
   EbpfTcpProxyConfigFactory() : FactoryBase("ebpf_tcp_proxy", true){};
 
-  ~EbpfTcpProxyConfigFactory() { EbpfLoader::unloadeBPFPrograms(interface_index); }
+  ~EbpfTcpProxyConfigFactory() {
+    try {
+      EbpfLoader::unloadeBPFPrograms(interface_index);
+    } catch (eBPFLoadException& e) {
+      ENVOY_LOG_MISC(error, e.what());
+    }
+  }
 
   std::string name() const override { return "ebpf_tcp_proxy"; }
 
