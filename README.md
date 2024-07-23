@@ -23,6 +23,8 @@ To build the Envoy static binary:
 2. `ln -s ebpf_tcp_proxy.proto envoy/api/envoy/extensions/filters/network/tcp_proxy/v3/`
 3. `bazel build --linkopt="-lbpf" //:envoy`
 
+Note that on the first time this may take a while because [it has to compile all of envoy](https://www.envoyproxy.io/docs/envoy/latest/faq/build/speed)
+
 TODO: remove step 2
 
 ## Running
