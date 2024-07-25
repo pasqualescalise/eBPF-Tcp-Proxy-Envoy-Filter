@@ -13,6 +13,15 @@
 #define MAX_TCP_SIZE 1480 // TODO: find a more precise number
 #define MAX_ENTRIES_MAP 65536
 
+// Get the interface index to redirect packets to
+// XXX: can be replaced with a HASH to support multiple interfaces
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, __u32);
+  __type(value, int);
+  __uint(max_entries, 1);
+} interface_index_map SEC(".maps");
+
 // Map each connection to its parameters
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -450,6 +459,25 @@ static void update_tcp_checksum(void* data, void* data_end, struct iphdr* ip, st
   tcp->check = csum;
 }
 
+/* Redirecting */
+
+/**
+ * Redirect packets using the interface_index_map
+ *
+ * Works for both XDP and TC
+ *
+ * XXX: I had problems with DEVMAPs and TC, this is a good medium that can be used by both programs
+ */
+static long bpf_redirect_array(__u64 flags) {
+  int zero = 0;
+  int* interface_index = (int*)bpf_map_lookup_elem(&interface_index_map, &zero);
+  if (interface_index == NULL) {
+    return -1;
+  }
+
+  return bpf_redirect(*interface_index, flags);
+}
+
 /* REDIRECT PACKET */
 
 /* New Connection */
@@ -726,8 +754,12 @@ int redirect_packet_main(struct xdp_md* ctx) {
   // bpf_printk("");
 
   // redirect the packet
-  // TODO: make the ifindex programmable
-  return bpf_redirect(3, 0);
+  long red = bpf_redirect_array(0);
+  if (red != XDP_REDIRECT) {
+    goto pass;
+  }
+
+  return XDP_REDIRECT;
 
   // TODO: return DROP on error?
 pass:
@@ -781,8 +813,12 @@ static __always_inline int reply_fin_back(void* data, void* data_end, struct eth
   update_ip_checksum(ip);
   update_tcp_checksum(data, data_end, ip, tcp);
 
-  // TODO: make the ifindex programmable
-  return bpf_redirect(3, BPF_F_INGRESS);
+  long red = bpf_redirect_array(BPF_F_INGRESS);
+  if (red != TC_ACT_REDIRECT) {
+    return TC_ACT_OK;
+  }
+
+  return TC_ACT_REDIRECT;
 }
 
 /**

@@ -16,6 +16,7 @@ bool EbpfLoader::ebpf_loaded = false;
  */
 void EbpfLoader::loadeBPFPrograms(int interface_index,
                                   int* connection_fingerprint_to_connection_fingerprint_map_fd) {
+  int err;
 
   if (ebpf_loaded) {
     return;
@@ -49,6 +50,14 @@ void EbpfLoader::loadeBPFPrograms(int interface_index,
   // get the map file descriptor from the eBPF object
   *connection_fingerprint_to_connection_fingerprint_map_fd =
       bpf_map__fd(obj->maps.connection_fingerprint_to_connection_fingerprint_map);
+
+  // put the interface index in a BPF_MAP_TYPE_ARRAY
+  __u32 zero = 0;
+  err = bpf_map_update_elem(bpf_map__fd(obj->maps.interface_index_map), &zero, &interface_index,
+                            BPF_ANY);
+  if (err < 0) {
+    throw eBPFLoadException("Error while updating eBPF interface index map");
+  }
 
   ENVOY_LOG_MISC(trace, "Successfully attached!");
 }
