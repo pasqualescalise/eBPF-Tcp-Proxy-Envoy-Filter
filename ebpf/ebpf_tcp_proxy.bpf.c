@@ -13,36 +13,6 @@
 #define MAX_TCP_SIZE 1480 // TODO: find a more precise number
 #define MAX_ENTRIES_MAP 65536
 
-// Program indexes
-enum {
-  PROG_XDP_PARSE_HEADERS = 0,
-  PROG_XDP_REDIRECT_PACKET,
-  PROG_CLS_BLOCK_FINS,
-
-  MAX_NUM_OF_PROGRAMS
-};
-
-// Programs map
-struct {
-  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __type(key, int);
-  __type(value, int);
-  __uint(max_entries, MAX_NUM_OF_PROGRAMS);
-} programs_map SEC(".maps");
-
-// Keep track of parsing between the programs
-struct parsing_context {
-  __u16 tcp_start;
-  int tcp_hdr_size;
-};
-
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __type(key, unsigned int);
-  __type(value, struct parsing_context);
-  __uint(max_entries, 1);
-} parsing_context_map SEC(".maps");
-
 // Map each connection to its parameters
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -99,7 +69,7 @@ struct tcp_sequence_ack_numbers_increment {
   unsigned int ack_increment;
 };
 
-/* PARSE HEADERS */
+/* Parse headers */
 
 static __always_inline int parse_ethhdr(void* data, void* data_end, __u16* nh_off,
                                         struct ethhdr** ethhdr) {
@@ -166,81 +136,58 @@ static __always_inline int parse_tcphdr(void* data, void* data_end, __u16* nh_of
 
 /**
  * Parse the Ethernet, IP and TCP headers: if a packet does not have these
- * three headers, pass it; otherwise, call the redirect_packet program
+ * three headers, return -1; otherwise, return 0
  */
-SEC("xdp/parse_headers")
-int parse_headers_main(struct xdp_md* ctx) {
+static __always_inline int parse_headers(void* data, void* data_end, struct ethhdr** eth,
+                                         struct iphdr** ip, struct tcphdr** tcp, __u16* tcp_start,
+                                         int* tcp_hdr_size) {
   int err;
 
   // keep track of layers, each time peeling off a header
   __u16 nf_off = 0;
   int hdr_size;
 
-  struct ethhdr* eth;
-  __u16 eth_type;
-
-  struct iphdr* ip;
-  int ip_protocol;
-
-  struct tcphdr* tcp;
-
-  void* data = (void*)(long)ctx->data;
-  void* data_end = (void*)(long)ctx->data_end;
-
   /* LAYER 2: ETHERNET */
 
-  eth_type = parse_ethhdr(data, data_end, &nf_off, &eth);
+  __u16 eth_type = parse_ethhdr(data, data_end, &nf_off, eth);
 
   if (data + sizeof(struct ethhdr) > data_end) {
     // bpf_printk("Packet is not a valid Ethernet packet, dropping it");
-    goto pass;
+    return -1;
   }
 
   /* LAYER 3: IP */
 
   if (eth_type != bpf_ntohs(ETH_P_IP)) {
     // bpf_printk("Packet is not IPv4, passing it");
-    goto pass;
+    return -1;
   }
 
-  hdr_size = parse_iphdr(data, data_end, &nf_off, &ip);
+  hdr_size = parse_iphdr(data, data_end, &nf_off, ip);
   if (hdr_size < 0) {
     // bpf_printk("Packet is not a valid IPv4 packet, dropping it");
-    goto pass;
+    return -1;
   }
 
   /* LAYER 4: TCP */
 
-  if (ip->protocol != IPPROTO_TCP) {
+  if ((*ip)->protocol != IPPROTO_TCP) {
     // bpf_printk("Packet is not TCP, passing it");
-    goto pass;
+    return -1;
   }
 
-  __u16 tcp_start = nf_off;
+  *tcp_start = nf_off;
 
-  hdr_size = parse_tcphdr(data, data_end, &nf_off, &tcp);
+  hdr_size = parse_tcphdr(data, data_end, &nf_off, tcp);
   if (hdr_size < 0) {
     // bpf_printk("Packet is not a valid TCP packet, dropping it");
-    goto pass;
+    return -1;
   }
 
-  // we have a TCP packet, redirect it to the other connection
-  unsigned int zero = 0;
-  struct parsing_context* pctx = bpf_map_lookup_elem(&parsing_context_map, &zero);
-  if (!pctx) {
-    goto pass;
-  }
+  *tcp_hdr_size = hdr_size;
 
-  pctx->tcp_start = tcp_start;
-  pctx->tcp_hdr_size = hdr_size;
-
-  bpf_tail_call(ctx, &programs_map, PROG_XDP_REDIRECT_PACKET);
-
-pass:
-  return XDP_PASS;
+  return 0;
 }
-
-/* REDIRECT PACKET */
 
 /* TCP Timestamps */
 struct tcp_timestamps_ctx {
@@ -503,14 +450,16 @@ static void update_tcp_checksum(void* data, void* data_end, struct iphdr* ip, st
   tcp->check = csum;
 }
 
+/* REDIRECT PACKET */
+
 /* New Connection */
 /**
  * Get all the parameters of the new connection and put them in the
  * connection_fingerprint_to_connection_parameters_map
  */
-static __always_inline int add_new_connection(void* data, void* data_end, __u16 tcp_start,
-                                              int tcp_hdr_size, struct ethhdr* eth,
-                                              struct iphdr* ip, struct tcphdr* tcp,
+static __always_inline int add_new_connection(void* data, void* data_end, struct ethhdr* eth,
+                                              struct iphdr* ip, struct tcphdr* tcp, __u16 tcp_start,
+                                              int tcp_hdr_size,
                                               struct connection_fingerprint* new_connection) {
   int err;
 
@@ -563,9 +512,9 @@ static __always_inline int add_new_connection(void* data, void* data_end, __u16 
  * If the packet is a TCP SYN, add the connection parameters to the
  * connection_fingerprint_to_connection_parameters_map
  */
-static __always_inline int handle_new_connection(void* data, void* data_end, __u16 tcp_start,
-                                                 int tcp_hdr_size, struct ethhdr* eth,
+static __always_inline int handle_new_connection(void* data, void* data_end, struct ethhdr* eth,
                                                  struct iphdr* ip, struct tcphdr* tcp,
+                                                 __u16 tcp_start, int tcp_hdr_size,
                                                  struct connection_fingerprint* new_connection) {
   int err;
 
@@ -576,7 +525,7 @@ static __always_inline int handle_new_connection(void* data, void* data_end, __u
 
   // bpf_printk("New connection");
 
-  err = add_new_connection(data, data_end, tcp_start, tcp_hdr_size, eth, ip, tcp, new_connection);
+  err = add_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, new_connection);
   if (err < 0) {
     // bpf_printk("Error while adding new connection");
     return err;
@@ -640,9 +589,10 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
  *
  * Returns 0 on success, 1 if the packet needs to be passed or a negative number on error
  */
-static __always_inline int handle_existing_connection(void* data, void* data_end, __u16 tcp_start,
-                                                      int tcp_hdr_size, struct ethhdr* eth,
-                                                      struct iphdr* ip, struct tcphdr* tcp,
+static __always_inline int handle_existing_connection(void* data, void* data_end,
+                                                      struct ethhdr* eth, struct iphdr* ip,
+                                                      struct tcphdr* tcp, __u16 tcp_start,
+                                                      int tcp_hdr_size,
                                                       struct connection_fingerprint connection,
                                                       struct connection_parameters* params) {
   int err = 0;
@@ -720,22 +670,17 @@ int redirect_packet_main(struct xdp_md* ctx) {
   void* data = (void*)(long)ctx->data;
   void* data_end = (void*)(long)ctx->data_end;
 
-  // restore the parsed headers
-  unsigned int zero = 0;
-  struct parsing_context* pctx = bpf_map_lookup_elem(&parsing_context_map, &zero);
-  if (!pctx) {
-    goto pass;
-  }
+  struct ethhdr* eth;
+  struct iphdr* ip;
+  struct tcphdr* tcp;
 
-  __u16 tcp_start = pctx->tcp_start;
-  int tcp_hdr_size = pctx->tcp_hdr_size;
+  __u16 tcp_start;
+  int tcp_hdr_size;
 
-  struct ethhdr* eth = data;
-  struct iphdr* ip = data + sizeof(struct ethhdr);
-  struct tcphdr* tcp = data + sizeof(struct ethhdr) + sizeof(*ip);
-
-  if ((void*)eth + sizeof(*eth) > data_end || (void*)ip + sizeof(*ip) > data_end ||
-      (void*)tcp + sizeof(*tcp) > data_end) {
+  // get the Ethernet, IP and TCP headers
+  err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
+  if (err < 0) {
+    // bpf_printk("Failed to parse headers for XDP");
     goto pass;
   }
 
@@ -759,7 +704,7 @@ int redirect_packet_main(struct xdp_md* ctx) {
 
   // new connection
   if (params == NULL) {
-    err = handle_new_connection(data, data_end, tcp_start, tcp_hdr_size, eth, ip, tcp, &connection);
+    err = handle_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, &connection);
     if (err < 0) {
       // bpf_printk("Error while handling new connection");
     }
@@ -768,7 +713,7 @@ int redirect_packet_main(struct xdp_md* ctx) {
   }
 
   // existing connection
-  err = handle_existing_connection(data, data_end, tcp_start, tcp_hdr_size, eth, ip, tcp,
+  err = handle_existing_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size,
                                    connection, params);
   if (err < 0) {
     // bpf_printk("Error while handling existing connection");
@@ -796,9 +741,9 @@ pass:
 /**
  * Redirect the FIN to the interface by swapping MACs, IPs, ports, updating timestamps and checksums
  */
-static __always_inline int reply_fin_back(void* data, void* data_end, __u16 tcp_start,
-                                          int tcp_hdr_size, struct ethhdr* eth, struct iphdr* ip,
-                                          struct tcphdr* tcp) {
+static __always_inline int reply_fin_back(void* data, void* data_end, struct ethhdr* eth,
+                                          struct iphdr* ip, struct tcphdr* tcp, __u16 tcp_start,
+                                          int tcp_hdr_size) {
   // swap MACs
   unsigned char temp_mac[ETH_ALEN];
   __builtin_memcpy(temp_mac, eth->h_source, ETH_ALEN);
@@ -880,61 +825,25 @@ static __always_inline int block_last_ack(struct iphdr* ip, struct tcphdr* tcp) 
 /**
  * Block all FINs on egress from exiting; instead, reply to them with fake FINs and drop the last
  * ACK
- *
- * TODO: create a separate function to do parsing and delete the first XDP program
  */
 SEC("cls/block_fins")
 int block_fins_main(struct __sk_buff* skb) {
   int err;
 
-  __u16 nf_off = 0;
-  int hdr_size;
-
-  struct ethhdr* eth;
-  __u16 eth_type;
-
-  struct iphdr* ip;
-  int ip_protocol;
-
-  struct tcphdr* tcp;
-
   void* data = (void*)(unsigned long long)skb->data;
   void* data_end = (void*)(unsigned long long)skb->data_end;
 
-  /* LAYER 2: ETHERNET */
+  struct ethhdr* eth;
+  struct iphdr* ip;
+  struct tcphdr* tcp;
 
-  eth_type = parse_ethhdr(data, data_end, &nf_off, &eth);
+  __u16 tcp_start;
+  int tcp_hdr_size;
 
-  if (data + sizeof(struct ethhdr) > data_end) {
-    // bpf_printk("Packet is not a valid Ethernet packet, dropping it");
-    goto pass;
-  }
-
-  /* LAYER 3: IP */
-
-  if (eth_type != bpf_ntohs(ETH_P_IP)) {
-    // bpf_printk("Packet is not IPv4, passing it");
-    goto pass;
-  }
-
-  hdr_size = parse_iphdr(data, data_end, &nf_off, &ip);
-  if (hdr_size < 0) {
-    // bpf_printk("Packet is not a valid IPv4 packet, dropping it");
-    goto pass;
-  }
-
-  /* LAYER 4: TCP */
-
-  if (ip->protocol != IPPROTO_TCP) {
-    // bpf_printk("Packet is not TCP, passing it");
-    goto pass;
-  }
-
-  __u16 tcp_start = nf_off;
-
-  hdr_size = parse_tcphdr(data, data_end, &nf_off, &tcp);
-  if (hdr_size < 0) {
-    // bpf_printk("Packet is not a valid TCP packet, dropping it");
+  // get the Ethernet, IP and TCP headers
+  err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
+  if (err < 0) {
+    // bpf_printk("Failed to parse headers for TC");
     goto pass;
   }
 
@@ -942,7 +851,7 @@ int block_fins_main(struct __sk_buff* skb) {
   if (tcp->fin) {
     // bpf_printk("Redirecting");
     // bpf_printk("");
-    return reply_fin_back(data, data_end, tcp_start, hdr_size, eth, ip, tcp);
+    return reply_fin_back(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size);
   }
 
   // we need to block the last single ACK

@@ -43,8 +43,7 @@ void EbpfLoader::loadeBPFPrograms(int interface_index,
     throw new eBPFLoadException("Error while loading eBPF program");
   }
 
-  attachXDP(skel, bpf_map__fd(obj->maps.programs_map), interface_index);
-
+  attachXDP(skel, interface_index);
   attachTC(skel, interface_index);
 
   // get the map file descriptor from the eBPF object
@@ -57,31 +56,13 @@ void EbpfLoader::loadeBPFPrograms(int interface_index,
 /**
  * Attach the first XDP program to the interface; also set up the program map to allow tail calls
  */
-void EbpfLoader::attachXDP(struct bpf_object_skeleton* skel, int programs_map_fd,
-                           int interface_index) {
+void EbpfLoader::attachXDP(struct bpf_object_skeleton* skel, int interface_index) {
   int err;
 
-  // put the XDP programs in the programs map
-  int xdp_index = 0;
-  for (int i = 0; i < skel->prog_cnt; i++) {
-    if (progs[i].type != BPF_PROG_TYPE_XDP) {
-      continue;
-    }
-
-    int prog_fd = bpf_program__fd(*(skel->progs[i].prog));
-
-    err = bpf_map_update_elem(programs_map_fd, &xdp_index, &prog_fd, BPF_ANY);
-    if (err) {
-      throw new eBPFLoadException("Error while adding eBPF XDP program to map");
-    }
-
-    xdp_index++;
-  }
-
   // attach the first XDP program to the interface
-  err =
-      bpf_xdp_attach(interface_index, bpf_program__fd(*(skel->progs[PROG_XDP_PARSE_HEADERS].prog)),
-                     XDP_FLAGS_DRV_MODE, NULL);
+  err = bpf_xdp_attach(interface_index,
+                       bpf_program__fd(*(skel->progs[PROG_XDP_REDIRECT_PACKET].prog)),
+                       XDP_FLAGS_DRV_MODE, NULL);
   if (err) {
     throw(eBPFLoadException("Error while attaching the XDP program to the interface"));
   }

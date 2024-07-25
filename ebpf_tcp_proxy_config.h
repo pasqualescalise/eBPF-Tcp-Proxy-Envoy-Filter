@@ -29,8 +29,7 @@ public:
 private:
   // program indexes
   enum {
-    PROG_XDP_PARSE_HEADERS = 0,
-    PROG_XDP_REDIRECT_PACKET,
+    PROG_XDP_REDIRECT_PACKET = 0,
     PROG_CLS_BLOCK_FINS,
 
     MAX_NUM_OF_PROGRAMS
@@ -45,7 +44,6 @@ private:
 
   // description of all the programs
   static constexpr const ProgramDescription progs[] = {
-      {"xdp/parse_headers", BPF_PROG_TYPE_XDP, PROG_XDP_PARSE_HEADERS, NULL},
       {"xdp/redirect_packet", BPF_PROG_TYPE_XDP, PROG_XDP_REDIRECT_PACKET, NULL},
       {"cls/block_fins", BPF_PROG_TYPE_SCHED_CLS, PROG_CLS_BLOCK_FINS, NULL},
   };
@@ -54,7 +52,7 @@ private:
   // XXX: we assume only one interface wants to be configured
   static bool ebpf_loaded;
 
-  static void attachXDP(struct bpf_object_skeleton* skel, int programs_map_fd, int interface_index);
+  static void attachXDP(struct bpf_object_skeleton* skel, int interface_index);
   static void attachTC(struct bpf_object_skeleton* skel, int interface_index);
 
   static void detachXDP(int interface_index);
