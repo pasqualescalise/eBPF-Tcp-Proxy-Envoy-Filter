@@ -28,7 +28,7 @@ void EbpfLoader::loadeBPFPrograms(int interface_index,
   // open eBPF application
   struct ebpf_tcp_proxy_bpf* obj = ebpf_tcp_proxy_bpf__open();
   if (!obj) {
-    throw new eBPFLoadException("Error while opening eBPF skeleton");
+    throw eBPFLoadException("Error while opening eBPF skeleton");
   }
 
   skel = obj->skeleton;
@@ -40,7 +40,7 @@ void EbpfLoader::loadeBPFPrograms(int interface_index,
 
   // load and verify eBPF programs
   if (ebpf_tcp_proxy_bpf__load(obj)) {
-    throw new eBPFLoadException("Error while loading eBPF program");
+    throw eBPFLoadException("Error while loading eBPF program");
   }
 
   attachXDP(skel, interface_index);
@@ -64,7 +64,7 @@ void EbpfLoader::attachXDP(struct bpf_object_skeleton* skel, int interface_index
                        bpf_program__fd(*(skel->progs[PROG_XDP_REDIRECT_PACKET].prog)),
                        XDP_FLAGS_DRV_MODE, NULL);
   if (err) {
-    throw(eBPFLoadException("Error while attaching the XDP program to the interface"));
+    throw eBPFLoadException("Error while attaching the XDP program to the interface");
   }
 }
 
@@ -82,7 +82,7 @@ void EbpfLoader::attachTC(struct bpf_object_skeleton* skel, int interface_index)
 
   int tc_fd = bpf_program__fd(*(skel->progs[PROG_CLS_BLOCK_FINS].prog));
   if (tc_fd < 0) {
-    throw new eBPFLoadException("Error while looking for the TC program");
+    throw eBPFLoadException("Error while looking for the TC program");
   }
 
   tc_options.prog_fd = tc_fd;
@@ -92,7 +92,7 @@ void EbpfLoader::attachTC(struct bpf_object_skeleton* skel, int interface_index)
   if (err == -EEXIST) {
     ENVOY_LOG_MISC(trace, "The TC hook already existed, continue");
   } else if (err) {
-    throw new eBPFLoadException("Failed to create TC hook");
+    throw eBPFLoadException("Failed to create TC hook");
   }
 
   tc_options.flags = BPF_TC_F_REPLACE;
@@ -100,7 +100,7 @@ void EbpfLoader::attachTC(struct bpf_object_skeleton* skel, int interface_index)
 
   err = bpf_tc_attach(&hook, &tc_options);
   if (err) {
-    throw new eBPFLoadException("Failed to attach TC program to interface");
+    throw eBPFLoadException("Failed to attach TC program to interface");
   }
 }
 
@@ -126,7 +126,7 @@ void EbpfLoader::detachXDP(int interface_index) {
     }
   }
 
-  throw new eBPFLoadException("Could not find a XDP program to detach");
+  throw eBPFLoadException("Could not find a XDP program to detach");
 }
 
 /**
