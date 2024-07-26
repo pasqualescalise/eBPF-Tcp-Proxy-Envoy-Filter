@@ -10,7 +10,7 @@
 #include <linux/pkt_cls.h>
 
 #define MIDDLEWARE_PORT 4444
-#define MAX_TCP_SIZE 1480 // TODO: find a more precise number
+#define MAX_TCP_SIZE 1480 // XXX: huge approximation but it works
 #define MAX_ENTRIES_MAP 65536
 
 // Get the interface index to redirect packets to
@@ -761,7 +761,6 @@ int redirect_packet_main(struct xdp_md* ctx) {
 
   return XDP_REDIRECT;
 
-  // TODO: return DROP on error?
 pass:
   // bpf_printk("Passing");
   // bpf_printk("");
