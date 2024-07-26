@@ -112,7 +112,7 @@ void EbpfLoader::attachTC(struct bpf_object_skeleton* skel, int interface_index)
  */
 void EbpfLoader::unloadeBPFPrograms(int interface_index) {
   detachXDP(interface_index);
-  detachTC();
+  detachTC(interface_index);
 }
 
 /**

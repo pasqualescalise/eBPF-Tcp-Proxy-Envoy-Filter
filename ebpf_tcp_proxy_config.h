@@ -56,7 +56,7 @@ private:
   static void attachTC(struct bpf_object_skeleton* skel, int interface_index);
 
   static void detachXDP(int interface_index);
-  static void detachTC();
+  static void detachTC(int interface_index);
 };
 
 /**
