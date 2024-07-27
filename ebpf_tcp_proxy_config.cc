@@ -111,6 +111,10 @@ void EbpfLoader::attachTC(struct bpf_object_skeleton* skel, int interface_index)
  * Unload and detach the eBPF programs
  */
 void EbpfLoader::unloadeBPFPrograms(int interface_index) {
+  if (!ebpf_loaded) {
+    return;
+  }
+
   detachXDP(interface_index);
   detachTC(interface_index);
 }
@@ -135,14 +139,15 @@ void EbpfLoader::detachXDP(int interface_index) {
 /**
  * Detach the TC program and delete the qdisc
  *
- * XXX: this completely deletes the clsact qdisc, this assumes that there are no other TC programs on there
+ * XXX: this completely deletes the clsact qdisc, this assumes that there are no other TC programs
+ * on there
  */
 void EbpfLoader::detachTC(int interface_index) {
-    LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = interface_index, .attach_point = BPF_TC_EGRESS);
-	int err = bpf_tc_hook_destroy(&hook);
-	if (err < 0) {
-  	 	throw eBPFLoadException("Failed to detach TC");
-	}
+  LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = interface_index, .attach_point = BPF_TC_EGRESS);
+  int err = bpf_tc_hook_destroy(&hook);
+  if (err < 0) {
+    throw eBPFLoadException("Failed to detach TC");
+  }
 }
 
 /**
