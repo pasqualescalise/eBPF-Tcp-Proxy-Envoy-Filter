@@ -8,7 +8,9 @@
 #include "envoy/extensions/filters/network/tcp_proxy/v3/ebpf_tcp_proxy.pb.h"
 #include "envoy/extensions/filters/network/tcp_proxy/v3/ebpf_tcp_proxy.pb.validate.h"
 
-#include "ebpf_tcp_proxy.skel.h"
+extern "C" {
+    #include "ebpf_tcp_proxy.skel.h"
+}
 
 namespace Envoy {
 namespace Extensions {
