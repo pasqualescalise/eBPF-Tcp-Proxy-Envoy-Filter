@@ -7,38 +7,37 @@ load(
     "envoy_cc_test",
 )
 
+load("bpf.bzl", "bpf_program")
+load("bpf.bzl", "bpf_skeleton")
+
+# The eBPF program.
+bpf_program(
+    name = "ebpf_object",
+    src = "ebpf/ebpf_tcp_proxy.bpf.c",
+    hdrs = [
+        "vmlinux/vmlinux.h",
+    ],
+    bpf_object = "ebpf/ebpf_tcp_proxy.bpf.o",
+)
+
+# The skeleton header file generated from the eBPF program.
+bpf_skeleton(
+    name = "ebpf_skeleton",
+    bpf_object = ":ebpf_object",
+    skel_hdr = "ebpf_tcp_proxy.skel.h",
+)
+
 envoy_cc_binary(
     name = "envoy",
     repository = "@envoy",
     deps = [
         ":ebpf_tcp_proxy_config",
         "@envoy//source/exe:envoy_main_entry_lib",
+        "@linux//:libbpf",
     ],
-)
-
-# Compile the eBPF code
-genrule(
-	name = "ebpf_object",
-	outs = ["ebpf/ebpf_tcp_proxy.bpf.o"],
-
-	srcs = ["ebpf/ebpf_tcp_proxy.bpf.c"],
-
-    cmd = """
-	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -c $< -o $@
-    """,
-)
-
-# Generate eBPF programs skeleton file
-genrule(
-	name = "ebpf_skeleton",
-	outs = ["ebpf_tcp_proxy.skel.h"],
-
-	srcs = ["ebpf/ebpf_tcp_proxy.bpf.o"],
-
-	# XXX: this sed hack is needed to change C casts to the C++ ones
-    cmd = """
-	bpftool gen skeleton $< | sed -e "s/\\(= \\)(\\([^)]*\\))\\(.*\\);/\\1static_cast<\\2>(\\3);/" -e "s/\\(return \\)(\\([^)]*\\))\\(.*\\)/\\1static_cast<\\2>(\\3/" -e "s/static_cast<void \\*>/const_cast<void \\*>/" -e "s/static_cast<void \\*\\*>/reinterpret_cast<void **>/" | sed -z -e 's/";\\n}/\\");\\n}/' > $@
-    """,
+    linkopts = [
+        "-lelf", "-lz"
+    ],
 )
 
 envoy_cc_library(
@@ -53,6 +52,7 @@ envoy_cc_library(
         "@envoy//source/common/common:assert_lib",
         "@envoy//source/common/common:logger_lib",
         "@envoy//source/common/tcp_proxy:tcp_proxy",
+        "@linux//:libbpf",
     ],
 )
 
@@ -67,5 +67,6 @@ envoy_cc_library(
         "@envoy//envoy/registry:registry",
         "@envoy//envoy/server:filter_config_interface",
         "@envoy//source/extensions/filters/network/tcp_proxy:config",
+        "@linux//:libbpf",
     ],
 )
