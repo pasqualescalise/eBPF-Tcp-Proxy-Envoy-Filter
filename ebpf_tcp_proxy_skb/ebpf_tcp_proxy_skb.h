@@ -11,15 +11,16 @@
 namespace Envoy {
 namespace TcpProxy {
 namespace EbpfTcpProxy {
+namespace EbpfTcpProxySKB {
 
 /**
- * This filter extends the TcpProxy Filter, using eBPF to accelerate it
+ * This filter extends the TcpProxy Filter, using SOCKOPS and SK_SKB eBPF programs to accelerate it
  */
-class EbpfTcpProxy : public Filter {
+class EbpfTcpProxySKB : public Filter {
 public:
-  EbpfTcpProxy(ConfigSharedPtr config, Upstream::ClusterManager& cluster_manager,
+  EbpfTcpProxySKB(ConfigSharedPtr config, Upstream::ClusterManager& cluster_manager, int sockhash_fd_,
                int connection_fingerprint_to_connection_fingerprint_map_fd_)
-      : Filter(config, cluster_manager),
+      : Filter(config, cluster_manager), sockhash_fd(sockhash_fd_),
         connection_fingerprint_to_connection_fingerprint_map_fd(
             connection_fingerprint_to_connection_fingerprint_map_fd_){};
 
@@ -32,11 +33,13 @@ private:
   };
 
   ConnectionFingerprint client_fingerprint, server_fingerprint;
+  int sockhash_fd;
   int connection_fingerprint_to_connection_fingerprint_map_fd;
 
   void bindClientAndServerConnections();
 };
 
+} // namespace EbpfTcpProxySKB
 } // namespace EbpfTcpProxy
 } // namespace TcpProxy
 } // namespace Envoy

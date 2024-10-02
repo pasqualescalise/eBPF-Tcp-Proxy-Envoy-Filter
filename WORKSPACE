@@ -1,4 +1,4 @@
-workspace(name = "envoy_filter_example")
+workspace(name = "ebpf_tcp_proxy")
 
 local_repository(
     name = "envoy",

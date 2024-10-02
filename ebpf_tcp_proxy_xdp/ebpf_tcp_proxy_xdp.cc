@@ -1,4 +1,4 @@
-#include "ebpf_tcp_proxy.h"
+#include "ebpf_tcp_proxy_xdp.h"
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/network/connection.h"
@@ -8,8 +8,9 @@
 namespace Envoy {
 namespace TcpProxy {
 namespace EbpfTcpProxy {
+namespace EbpfTcpProxyXDP {
 
-Network::FilterStatus EbpfTcpProxy::onData(Buffer::Instance& data, bool end_stream) {
+Network::FilterStatus EbpfTcpProxyXDP::onData(Buffer::Instance& data, bool end_stream) {
   ENVOY_CONN_LOG(trace, "downstream connection received {} bytes, end_stream={}, has upstream {}",
                  read_callbacks_->connection(), data.length(), end_stream, upstream_ != nullptr);
 
@@ -33,7 +34,7 @@ Network::FilterStatus EbpfTcpProxy::onData(Buffer::Instance& data, bool end_stre
  * Get the Client and Server ConnectionFingerprints and put them in
  * connection_fingerprint_to_connection_fingerprint_map
  */
-void EbpfTcpProxy::bindClientAndServerConnections() {
+void EbpfTcpProxyXDP::bindClientAndServerConnections() {
   client_fingerprint.ip =
       getStreamInfo().downstreamAddressProvider().remoteAddress()->ip()->ipv4()->address();
   client_fingerprint.port =
@@ -62,6 +63,7 @@ void EbpfTcpProxy::bindClientAndServerConnections() {
   }
 }
 
+} // namespace EbpfTcpProxyXDP
 } // namespace EbpfTcpProxy
 } // namespace TcpProxy
 } // namespace Envoy

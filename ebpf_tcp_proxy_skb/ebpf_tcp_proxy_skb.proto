@@ -4,10 +4,7 @@ package envoy.extensions.filters.network.tcp_proxy.v3;
 
 import "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.proto";
 
-message EbpfTcpProxy {
+message EbpfTcpProxySKB {
   // the configuration of the underlying TcpProxy filter
   TcpProxy tcp_proxy = 1;
-
-  // the interface to attach the eBPF programs to
-  int32 interface_index = 2;
 }

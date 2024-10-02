@@ -478,7 +478,7 @@ static long bpf_redirect_array(__u64 flags) {
   return bpf_redirect(*interface_index, flags);
 }
 
-/* REDIRECT PACKET */
+/* XDP - REDIRECT PACKET */
 
 /* New Connection */
 /**
@@ -767,7 +767,7 @@ pass:
   return XDP_PASS;
 }
 
-/* BLOCK FINS */
+/* TC - BLOCK FINS */
 
 /**
  * Redirect the FIN to the interface by swapping MACs, IPs, ports, updating timestamps and checksums
