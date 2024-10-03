@@ -9,6 +9,8 @@
 #include <linux/tcp.h>
 #include <linux/pkt_cls.h>
 
+#include "ebpf_tcp_proxy_log.h"
+
 #define MIDDLEWARE_PORT 4444
 #define MAX_TCP_SIZE 1480 // XXX: huge approximation but it works
 #define MAX_ENTRIES_MAP 65536
@@ -161,27 +163,27 @@ static __always_inline int parse_headers(void* data, void* data_end, struct ethh
   __u16 eth_type = parse_ethhdr(data, data_end, &nf_off, eth);
 
   if (data + sizeof(struct ethhdr) > data_end) {
-    // bpf_printk("Packet is not a valid Ethernet packet, dropping it");
+    bpf_log_err("Packet is not a valid Ethernet packet, dropping it");
     return -1;
   }
 
   /* LAYER 3: IP */
 
   if (eth_type != bpf_ntohs(ETH_P_IP)) {
-    // bpf_printk("Packet is not IPv4, passing it");
+    bpf_log_warning("Packet is not IPv4, passing it");
     return -1;
   }
 
   hdr_size = parse_iphdr(data, data_end, &nf_off, ip);
   if (hdr_size < 0) {
-    // bpf_printk("Packet is not a valid IPv4 packet, dropping it");
+    bpf_log_warning("Packet is not a valid IPv4 packet, dropping it");
     return -1;
   }
 
   /* LAYER 4: TCP */
 
   if ((*ip)->protocol != IPPROTO_TCP) {
-    // bpf_printk("Packet is not TCP, passing it");
+    bpf_log_warning("Packet is not TCP, passing it");
     return -1;
   }
 
@@ -189,7 +191,7 @@ static __always_inline int parse_headers(void* data, void* data_end, struct ethh
 
   hdr_size = parse_tcphdr(data, data_end, &nf_off, tcp);
   if (hdr_size < 0) {
-    // bpf_printk("Packet is not a valid TCP packet, dropping it");
+    bpf_log_err("Packet is not a valid TCP packet, dropping it");
     return -1;
   }
 
@@ -229,7 +231,7 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
   __u8* data = (__u8*)(long)ctx->data;
   __u8* data_end = (__u8*)(long)ctx->data_end;
 
-  // bpf_printk("Skip: %d", ctx->skip);
+  bpf_log_debug("Skip: %d", ctx->skip);
   if (ctx->skip > 0) {
     ctx->skip--;
     return 0;
@@ -245,7 +247,7 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
     return 1;
   }
 
-  // bpf_printk("Type: %d", *option_type);
+  bpf_log_debug("Type: %d", *option_type);
 
   // No-Operation option
   if (*option_type == 0x01) {
@@ -260,7 +262,7 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
       return 1;
     }
 
-    // bpf_printk("Len: %d", *option_len);
+    bpf_log_debug("Len: %d", *option_len);
     // loop until the option is finished
     ctx->skip = *option_len - 1;
     return 0;
@@ -319,7 +321,7 @@ static int fast_extract_and_update_tcp_timestamps_option(
     return -1;
   }
 
-  // bpf_printk("Fast path for TCP options");
+  bpf_log_debug("Fast path for TCP options");
 
   unsigned int* tsval = (unsigned int*)(data + tcp_options_start_offset + 4);
 
@@ -367,7 +369,7 @@ static int extract_and_update_tcp_timestamps_option(
     return 0;
   }
 
-  // bpf_printk("Slow path for TCP options - expected for SYN packets");
+  // bpf_log_debug("Slow path for TCP options - expected for SYN packets");
 
   struct tcp_timestamps_ctx loop_ctx = {.data = data,
                                         .data_end = data_end,
@@ -384,7 +386,7 @@ static int extract_and_update_tcp_timestamps_option(
 
   int nr = bpf_loop(tcp_hdr_size, (void*)extract_and_update_tcp_timestamps_loop, &loop_ctx, 0);
   if (nr < 0) {
-    // bpf_printk("Error in extract_and_update_tcp_timestamps_loop");
+    // bpf_log_err("Error in extract_and_update_tcp_timestamps_loop");
     return nr;
   }
 
@@ -547,15 +549,15 @@ static __always_inline int handle_new_connection(void* data, void* data_end, str
   int err;
 
   if (tcp->syn != 1) {
-    // bpf_printk("Unexpected packet");
+    bpf_log_err("Unexpected packet");
     return -1;
   }
 
-  // bpf_printk("New connection");
+  bpf_log_debug("New connection");
 
   err = add_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, new_connection);
   if (err < 0) {
-    // bpf_printk("Error while adding new connection");
+    bpf_log_err("Error while adding new connection");
     return err;
   }
 
@@ -602,7 +604,7 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
   err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
                                                  extracted_timestamps, &new_timestamps, 0);
   if (err < 0) {
-    // bpf_printk("Error while updating the TCP Timestamps option");
+    bpf_log_err("Error while updating the TCP Timestamps option");
     return err;
   }
 
@@ -636,7 +638,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
       params->base_ack_number = bpf_ntohl(bpf_ntohl(tcp->ack_seq) - 1);
     }
 
-    // bpf_printk("Passing this ack");
+    bpf_log_debug("Passing this ack");
     return 1;
   }
 
@@ -649,7 +651,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   struct connection_fingerprint* other_conn = (struct connection_fingerprint*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_fingerprint_map, &connection);
   if (other_conn == NULL) {
-    // bpf_printk("No mapping (expected for the first PUSH/ACK)");
+    bpf_log_warning("No mapping (expected for the first PUSH/ACK)");
     return -1;
   }
 
@@ -657,7 +659,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   struct connection_parameters* other_params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, other_conn);
   if (other_params == NULL) {
-    // bpf_printk("No reverse");
+    bpf_log_warning("No reverse");
     return -1;
   }
 
@@ -665,7 +667,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   err = update_packet(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, other_params,
                       &params->timestamps, increment);
   if (err < 0) {
-    // bpf_printk("Error while updating the packet");
+    bpf_log_err("Error while updating the packet");
     return err;
   }
 
@@ -677,11 +679,11 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin) {
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &connection);
     if (err < 0) {
-      // bpf_printk("Error while deleting the connection");
+      bpf_log_err("Error while deleting the connection");
     }
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &other_conn);
     if (err < 0) {
-      // bpf_printk("Error while deleting the other connection");
+      bpf_log_err("Error while deleting the other connection");
     }
   }
 
@@ -705,12 +707,10 @@ int redirect_packet_main(struct xdp_md* ctx) {
   __u16 tcp_start;
   int tcp_hdr_size;
 
-  // bpf_printk("Packet received");
-
   // get the Ethernet, IP and TCP headers
   err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
   if (err < 0) {
-    // bpf_printk("Failed to parse headers for XDP");
+    bpf_log_err("Failed to parse headers for XDP");
     goto pass;
   }
 
@@ -718,16 +718,16 @@ int redirect_packet_main(struct xdp_md* ctx) {
   struct connection_fingerprint connection;
 
   if (bpf_ntohs(tcp->dest) == MIDDLEWARE_PORT) {
-    // bpf_printk("Message from Client");
+    bpf_log_debug("Message from Client");
     connection.ip = ip->saddr;
     connection.port = bpf_htons(tcp->source);
   } else {
-    // bpf_printk("Message from Server");
+    bpf_log_debug("Message from Server");
     connection.ip = ip->saddr;
     connection.port = bpf_ntohs(tcp->dest);
   }
 
-  // bpf_printk("IP: %u, Port: %u", connection.ip, connection.port);
+  bpf_log_debug("IP: %u, Port: %u", connection.ip, connection.port);
 
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
@@ -736,7 +736,7 @@ int redirect_packet_main(struct xdp_md* ctx) {
   if (params == NULL) {
     err = handle_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, &connection);
     if (err < 0) {
-      // bpf_printk("Error while handling new connection");
+      bpf_log_err("Error while handling new connection");
     }
 
     goto pass;
@@ -746,14 +746,13 @@ int redirect_packet_main(struct xdp_md* ctx) {
   err = handle_existing_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size,
                                    connection, params);
   if (err < 0) {
-    // bpf_printk("Error while handling existing connection");
+    bpf_log_err("Error while handling existing connection");
     goto pass;
   } else if (err == 1) {
     goto pass;
   }
 
-  // bpf_printk("Redirecting");
-  // bpf_printk("");
+  bpf_log_debug("Redirecting");
 
   // redirect the packet
   long red = bpf_redirect_array(0);
@@ -764,8 +763,7 @@ int redirect_packet_main(struct xdp_md* ctx) {
   return XDP_REDIRECT;
 
 pass:
-  // bpf_printk("Passing");
-  // bpf_printk("");
+  bpf_log_debug("Passing");
   return XDP_PASS;
 }
 
@@ -830,24 +828,23 @@ static __always_inline int block_last_ack(struct iphdr* ip, struct tcphdr* tcp) 
   struct connection_fingerprint connection;
 
   if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
-    // bpf_printk("Message to Client");
+    bpf_log_debug("Message to Client");
     connection.ip = ip->daddr;
     connection.port = bpf_htons(tcp->dest);
   } else {
-    // bpf_printk("Message to Server");
+    bpf_log_debug("Message to Server");
     connection.ip = ip->daddr;
     connection.port = bpf_ntohs(tcp->source);
   }
 
-  // bpf_printk("IP: %u, Port: %u", connection.ip, connection.port);
+  bpf_log_debug("IP: %u, Port: %u", connection.ip, connection.port);
 
   // get the parameters of the connection
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
 
   if (params == NULL) {
-    // bpf_printk("Error");
-    // bpf_printk("");
+    bpf_log_err("Error");
     return -1;
   }
 
@@ -880,14 +877,13 @@ int block_fins_main(struct __sk_buff* skb) {
   // get the Ethernet, IP and TCP headers
   err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
   if (err < 0) {
-    // bpf_printk("Failed to parse headers for TC");
+    bpf_log_err("Failed to parse headers for TC");
     goto pass;
   }
 
   // reply with a fake FIN
   if (tcp->fin) {
-    // bpf_printk("Redirecting");
-    // bpf_printk("");
+    bpf_log_debug("Redirecting");
     return reply_fin_back(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size);
   }
 
@@ -898,14 +894,12 @@ int block_fins_main(struct __sk_buff* skb) {
       goto pass;
     }
 
-    // bpf_printk("Dropping");
-    // bpf_printk("");
+    bpf_log_debug("Dropping");
     return TC_ACT_SHOT;
   }
 
 pass:
-  // bpf_printk("Passing");
-  // bpf_printk("");
+  bpf_log_debug("Passing");
   return TC_ACT_OK;
 }
 
