@@ -17,7 +17,7 @@ static_resources:
         - name: ebpf_tcp_proxy
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxy
-            interface_index: 3
+            interface_index: 5
             tcp_proxy:
                 cluster: kafka1_cluster
                 stat_prefix: kafka1_cluster_stats
@@ -29,7 +29,7 @@ static_resources:
         - name: ebpf_tcp_proxy
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxy
-            interface_index: 3
+            interface_index: 5
             tcp_proxy:
                 cluster: kafka2_cluster
                 stat_prefix: kafka2_cluster_stats

@@ -7,6 +7,10 @@ load(
     "envoy_cc_test",
 )
 
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+
 load("bpf.bzl", "bpf_program")
 load("bpf.bzl", "bpf_skeleton")
 
@@ -25,19 +29,6 @@ bpf_skeleton(
     name = "ebpf_skeleton",
     bpf_object = ":ebpf_object",
     skel_hdr = "ebpf_tcp_proxy.skel.h",
-)
-
-envoy_cc_binary(
-    name = "envoy",
-    repository = "@envoy",
-    deps = [
-        ":ebpf_tcp_proxy_config",
-        "@envoy//source/exe:envoy_main_entry_lib",
-        "@linux//:libbpf",
-    ],
-    linkopts = [
-        "-lelf", "-lz"
-    ],
 )
 
 envoy_cc_library(
@@ -69,4 +60,38 @@ envoy_cc_library(
         "@envoy//source/extensions/filters/network/tcp_proxy:config",
         "@linux//:libbpf",
     ],
+)
+
+envoy_cc_binary(
+    name = "envoy",
+    repository = "@envoy",
+    deps = [
+        ":ebpf_tcp_proxy_config",
+        "@envoy//source/exe:envoy_main_entry_lib",
+        "@linux//:libbpf",
+    ],
+    linkopts = [
+        "-lelf", "-lz"
+    ],
+)
+
+# Packaging the binary into tar, which is needed by oci_image rule
+pkg_tar(
+    name = "tar",
+    srcs = [":envoy"],
+)
+
+oci_image(
+    name = "ebpf_tcp_proxy_image",
+    base = "@docker_lib_ubuntu",
+    tars = [":tar"],
+    entrypoint = ["/envoy"],
+)
+
+# Use with 'bazel run' to load the oci image into a container runtime.
+# The image is designated using `repo_tags` attribute.
+oci_load(
+    name = "image_load",
+    image = ":ebpf_tcp_proxy_image",
+    repo_tags = ["ebpf_tcp_proxy_envoy:latest"],
 )
