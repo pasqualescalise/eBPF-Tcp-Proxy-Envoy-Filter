@@ -26,6 +26,33 @@ new_git_repository(
     build_file = "//:linux.BUILD",
 )
 
+http_archive(
+    name = "rules_oci",
+    sha256 = "d007e6c96eb62c88397b68f329e4ca56e0cfe31204a2c54b0cb17819f89f83c8",
+    strip_prefix = "rules_oci-2.0.0",
+    url = "https://github.com/bazel-contrib/rules_oci/releases/download/v2.0.0/rules_oci-v2.0.0.tar.gz",
+)
+
+load("@rules_oci//oci:dependencies.bzl", "rules_oci_dependencies")
+
+rules_oci_dependencies()
+
+load("@rules_oci//oci:repositories.bzl", "oci_register_toolchains")
+
+oci_register_toolchains(name = "oci")
+
+# You can pull your base images using oci_pull like this:
+load("@rules_oci//oci:pull.bzl", "oci_pull")
+
+oci_pull(
+    name = "docker_lib_ubuntu",
+    image = "gcr.io/bazel-public/bazel",
+    platforms = [
+        "linux/amd64",
+    ],
+    tag = "latest",
+)
+
 load("@envoy//bazel:api_binding.bzl", "envoy_api_binding")
 
 envoy_api_binding()

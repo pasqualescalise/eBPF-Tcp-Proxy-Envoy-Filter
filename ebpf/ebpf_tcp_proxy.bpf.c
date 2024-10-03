@@ -705,6 +705,8 @@ int redirect_packet_main(struct xdp_md* ctx) {
   __u16 tcp_start;
   int tcp_hdr_size;
 
+  // bpf_printk("Packet received");
+
   // get the Ethernet, IP and TCP headers
   err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
   if (err < 0) {
