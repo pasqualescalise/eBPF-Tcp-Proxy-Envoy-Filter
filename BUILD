@@ -4,11 +4,9 @@ load(
     "@envoy//bazel:envoy_build_system.bzl",
     "envoy_cc_binary",
     "envoy_cc_library",
-    "envoy_cc_test",
 )
 
 load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
-load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
 load("bpf.bzl", "bpf_program")
@@ -20,6 +18,10 @@ bpf_program(
     src = "ebpf/ebpf_tcp_proxy.bpf.c",
     hdrs = [
         "vmlinux/vmlinux.h",
+        "ebpf/ebpf_tcp_proxy_log.h",
+    ],
+    defines = [
+        "BPF_LOG_LEVEL=5",
     ],
     bpf_object = "ebpf/ebpf_tcp_proxy.bpf.o",
 )
