@@ -29,9 +29,11 @@ TODO: remove step 2
 
 ## Running
 
-`sudo ./bazel-bin/envoy --config-path ebpf_tcp_proxy_configuration.yaml`
+Once it has compiled, run on a Middleware server Envoy using the configuration file that uses this filter:
 
-## Configuration
+`sudo ./bazel-bin/envoy --config-path ./conf/ebpf_tcp_proxy_config.yaml`
+
+### Configuration
 
 Since this filter is an extension of TCP Proxy, it takes its own configuration parameters plus a whole configuration of TCP Proxy:
 
@@ -45,6 +47,36 @@ filters:
       # configuration of TCP proxy
       ...
 ```
+
+In the "conf" directory there are two example configuration files: they both use 3 envoy clusters (kafka1_cluster, kafka2_cluster, kafka3_cluster) and choose between these using the SNI "kafkax.server.test"
+
+These two configuration files can be used to test the EBPF Tcp Proxy filter against the vanilla Tcp Proxy one, just use the "envoy_config.yaml" instead of the "ebpf_tcp_proxy_config.yaml"
+
+## Benchmarking and testing
+
+* [iperf-ssl](https://github.com/TrekkieCoder/iperf-ssl)
+
+On the server, run `iperf --tls=v1.2 -s -p <server-port>`
+
+On the client, run `iperf --tls=v1.2 -c <middleware-ip> -p <middleware-port> -A kafkax.server.test`
+
+### HTTP benchmarking
+
+Most of the performace benefit where seen while requesting big (>10MB) files
+
+Setup a HTTP server (usually [nginx](https://nginx.org/)) and use the "/etc/hosts" to associate the kafkax.server.test to the Middleware
+
+* [autocannon](https://github.com/mcollina/autocannon)
+
+On the client, run `autocannon https://kafkax.server.test:<middleware-port>`
+
+* [wrk](https://github.com/wg/wrk)
+
+On the client, run `wrk https://kafkax.server.test:<middleware-port>`
+
+* [bombardier](https://github.com/codesenberg/bombardier)
+
+On the client, run `bombardier http://kafkax.server.test:<middleware-port>`
 
 ## How it works
 
