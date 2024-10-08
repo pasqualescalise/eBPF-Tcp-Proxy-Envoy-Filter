@@ -14,9 +14,9 @@ static_resources:
         server_names:
         - kafka1.server.test
       filters:
-        - name: ebpf_tcp_proxy
+        - name: ebpf_tcp_proxy_xdp
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxy
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxyXDP
             interface_index: 3
             tcp_proxy:
                 cluster: kafka1_cluster
@@ -26,9 +26,9 @@ static_resources:
         server_names:
         - kafka2.server.test
       filters:
-        - name: ebpf_tcp_proxy
+        - name: ebpf_tcp_proxy_xdp
           typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxy
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.EbpfTcpProxyXDP
             interface_index: 3
             tcp_proxy:
                 cluster: kafka2_cluster
