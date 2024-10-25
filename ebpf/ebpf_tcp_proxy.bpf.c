@@ -683,7 +683,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
     if (err < 0) {
       bpf_log_err("Error while deleting the connection");
     }
-    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &other_conn);
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, other_conn);
     if (err < 0) {
       bpf_log_err("Error while deleting the other connection");
     }
