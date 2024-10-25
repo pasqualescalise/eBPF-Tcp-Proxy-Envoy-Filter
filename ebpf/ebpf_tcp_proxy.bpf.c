@@ -355,7 +355,7 @@ static int fast_extract_and_update_tcp_timestamps_option(
  * Extract the TCP timestamps and put them in extracted_timestamps; if new_timestamps is not NULL,
  * also update them
  */
-static int extract_and_update_tcp_timestamps_option(
+static __always_inline int extract_and_update_tcp_timestamps_option(
     void* data, void* data_end, __u16 tcp_start, int tcp_hdr_size,
     struct tcp_timestamps_option* extracted_timestamps,
     struct tcp_timestamps_option* new_timestamps, int increment_timestamps) {
@@ -629,17 +629,20 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
 
   params->packet_counter++;
 
-  // on both connections, the second ACK packet must be skipped:
+  // on both connections, the second ACK packet is important:
   // + for the Client, it's the ACK of the handshake (get the base ack number
-  //   we missed in add_new_connection)
-  // + for the Server, it's the ACK of the first Client packet
+  //   we missed in add_new_connection), so it must be passed
+  // + for the Server, it's the ACK of the first Client packet; its connection has already been
+  // closed, so this ACK must be dropped
   if (tcp->ack && !tcp->psh && params->packet_counter == 2) {
     if (params->base_ack_number == 0) {
       params->base_ack_number = bpf_ntohl(bpf_ntohl(tcp->ack_seq) - 1);
+      bpf_log_notice("Passing this ACK");
+      return XDP_PASS;
+    } else {
+      bpf_log_notice("Dropping this ACK");
+      return XDP_DROP;
     }
-
-    bpf_log_notice("Passing this ack");
-    return 1;
   }
 
   // get the increment of the sequence numbers
@@ -752,8 +755,10 @@ int redirect_packet_main(struct xdp_md* ctx) {
   if (err < 0) {
     bpf_log_err("Error while handling existing connection");
     goto pass;
-  } else if (err == 1) {
+  } else if (err == XDP_PASS) {
     goto pass;
+  } else if (err == XDP_DROP) {
+    goto drop;
   }
 
   // redirect the packet
@@ -769,6 +774,10 @@ int redirect_packet_main(struct xdp_md* ctx) {
 pass:
   bpf_log_notice("Passing XDP\n");
   return XDP_PASS;
+
+drop:
+  bpf_log_notice("Dropping XDP\n");
+  return XDP_DROP;
 }
 
 /* BLOCK FINS */
