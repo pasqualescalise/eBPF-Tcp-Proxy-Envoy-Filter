@@ -23,7 +23,7 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
-#define BPF_LOG_DISABLED  (0)
+#define BPF_LOG_DISABLED (0)
 #define BPF_LOG_ERR (1)
 #define BPF_LOG_WARNING (2)
 #define BPF_LOG_NOTICE (3)
@@ -36,7 +36,7 @@
 
 #define bpf_log_err(...) (BPF_LOG_LEVEL < BPF_LOG_ERR ? (0) : bpf_printk(__VA_ARGS__))
 #define bpf_log_warning(...) (BPF_LOG_LEVEL < BPF_LOG_WARNING ? (0) : bpf_printk(__VA_ARGS__))
-#define bpf_log_notice(...) BPF_LOG_LEVEL < BPF_LOG_NOTICE ? (0) : bpf_printk(__VA_ARGS__))
+#define bpf_log_notice(...) (BPF_LOG_LEVEL < BPF_LOG_NOTICE ? (0) : bpf_printk(__VA_ARGS__))
 #define bpf_log_info(...) (BPF_LOG_LEVEL < BPF_LOG_INFO ? (0) : bpf_printk(__VA_ARGS__))
 #define bpf_log_debug(...) (BPF_LOG_LEVEL < BPF_LOG_DEBUG ? (0) : bpf_printk(__VA_ARGS__))
 

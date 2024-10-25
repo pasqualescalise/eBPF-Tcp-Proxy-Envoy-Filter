@@ -191,7 +191,7 @@ static __always_inline int parse_headers(void* data, void* data_end, struct ethh
 
   hdr_size = parse_tcphdr(data, data_end, &nf_off, tcp);
   if (hdr_size < 0) {
-    bpf_log_err("Packet is not a valid TCP packet, dropping it");
+    bpf_log_warning("Packet is not a valid TCP packet, dropping it");
     return -1;
   }
 
@@ -321,7 +321,7 @@ static int fast_extract_and_update_tcp_timestamps_option(
     return -1;
   }
 
-  bpf_log_debug("Fast path for TCP options");
+  bpf_log_info("Fast path for TCP options");
 
   unsigned int* tsval = (unsigned int*)(data + tcp_options_start_offset + 4);
 
@@ -369,7 +369,7 @@ static int extract_and_update_tcp_timestamps_option(
     return 0;
   }
 
-  // bpf_log_debug("Slow path for TCP options - expected for SYN packets");
+  bpf_log_info("Slow path for TCP options - expected for SYN packets");
 
   struct tcp_timestamps_ctx loop_ctx = {.data = data,
                                         .data_end = data_end,
@@ -386,7 +386,7 @@ static int extract_and_update_tcp_timestamps_option(
 
   int nr = bpf_loop(tcp_hdr_size, (void*)extract_and_update_tcp_timestamps_loop, &loop_ctx, 0);
   if (nr < 0) {
-    // bpf_log_err("Error in extract_and_update_tcp_timestamps_loop");
+    bpf_log_err("Error in extract_and_update_tcp_timestamps_loop");
     return nr;
   }
 
@@ -553,7 +553,7 @@ static __always_inline int handle_new_connection(void* data, void* data_end, str
     return -1;
   }
 
-  bpf_log_debug("New connection");
+  bpf_log_notice("New connection");
 
   err = add_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, new_connection);
   if (err < 0) {
@@ -638,7 +638,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
       params->base_ack_number = bpf_ntohl(bpf_ntohl(tcp->ack_seq) - 1);
     }
 
-    bpf_log_debug("Passing this ack");
+    bpf_log_notice("Passing this ack");
     return 1;
   }
 
@@ -672,11 +672,13 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   }
 
   if (tcp->fin) {
+    bpf_log_info("Seen FIN packet");
     params->seen_fin = 1;
   }
 
   // if we have seen both FINs, this is the last ACK, delete the map entries
   if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin) {
+    bpf_log_info("Finished communication, deleting map entries");
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &connection);
     if (err < 0) {
       bpf_log_err("Error while deleting the connection");
@@ -718,16 +720,18 @@ int redirect_packet_main(struct xdp_md* ctx) {
   struct connection_fingerprint connection;
 
   if (bpf_ntohs(tcp->dest) == MIDDLEWARE_PORT) {
-    bpf_log_debug("Message from Client");
+    bpf_log_notice("Message from Client SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh);
     connection.ip = ip->saddr;
     connection.port = bpf_htons(tcp->source);
   } else {
-    bpf_log_debug("Message from Server");
+    bpf_log_notice("Message from Server SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh);
     connection.ip = ip->saddr;
     connection.port = bpf_ntohs(tcp->dest);
   }
 
-  bpf_log_debug("IP: %u, Port: %u", connection.ip, connection.port);
+  bpf_log_info("IP: %u, Port: %u", connection.ip, connection.port);
 
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
@@ -752,18 +756,18 @@ int redirect_packet_main(struct xdp_md* ctx) {
     goto pass;
   }
 
-  bpf_log_debug("Redirecting");
-
   // redirect the packet
   long red = bpf_redirect_array(0);
   if (red != XDP_REDIRECT) {
+    bpf_log_err("Failed to redirect XDP, passing");
     goto pass;
   }
 
+  bpf_log_notice("Redirecting XDP\n");
   return XDP_REDIRECT;
 
 pass:
-  bpf_log_debug("Passing");
+  bpf_log_notice("Passing XDP\n");
   return XDP_PASS;
 }
 
@@ -814,9 +818,11 @@ static __always_inline int reply_fin_back(void* data, void* data_end, struct eth
 
   long red = bpf_redirect_array(BPF_F_INGRESS);
   if (red != TC_ACT_REDIRECT) {
+    bpf_log_err("Failed to redirect TC, passing\n");
     return TC_ACT_OK;
   }
 
+  bpf_log_notice("Redirected TC\n");
   return TC_ACT_REDIRECT;
 }
 
@@ -828,23 +834,21 @@ static __always_inline int block_last_ack(struct iphdr* ip, struct tcphdr* tcp) 
   struct connection_fingerprint connection;
 
   if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
-    bpf_log_debug("Message to Client");
     connection.ip = ip->daddr;
     connection.port = bpf_htons(tcp->dest);
   } else {
-    bpf_log_debug("Message to Server");
     connection.ip = ip->daddr;
     connection.port = bpf_ntohs(tcp->source);
   }
 
-  bpf_log_debug("IP: %u, Port: %u", connection.ip, connection.port);
+  bpf_log_info("IP: %u, Port: %u", connection.ip, connection.port);
 
   // get the parameters of the connection
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
 
   if (params == NULL) {
-    bpf_log_err("Error");
+    bpf_log_err("Error while looking up parameters");
     return -1;
   }
 
@@ -881,9 +885,16 @@ int block_fins_main(struct __sk_buff* skb) {
     goto pass;
   }
 
+  if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
+    bpf_log_notice("Message to Client SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh);
+  } else {
+    bpf_log_notice("Message to Server SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh);
+  }
+
   // reply with a fake FIN
   if (tcp->fin) {
-    bpf_log_debug("Redirecting");
     return reply_fin_back(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size);
   }
 
@@ -894,12 +905,12 @@ int block_fins_main(struct __sk_buff* skb) {
       goto pass;
     }
 
-    bpf_log_debug("Dropping");
+    bpf_log_notice("Dropping last ACK\n");
     return TC_ACT_SHOT;
   }
 
 pass:
-  bpf_log_debug("Passing");
+  bpf_log_notice("Passing TC\n");
   return TC_ACT_OK;
 }
 
