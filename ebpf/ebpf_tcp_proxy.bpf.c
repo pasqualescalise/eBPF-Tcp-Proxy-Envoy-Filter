@@ -627,6 +627,13 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
                                                       struct connection_parameters* params) {
   int err = 0;
 
+  // this should never happen
+  // TODO: check if we should do something to parameters if this happens
+  if (tcp->syn) {
+    bpf_log_err("Received SYN while handling existing connection");
+    return -1;
+  }
+
   params->packet_counter++;
 
   // on both connections, the second ACK packet is important:
@@ -658,6 +665,8 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
     return -1;
   }
 
+  bpf_log_info("OtherIP: %u, OtherPort: %u", other_conn->ip, other_conn->port);
+
   // get the parameters of the other connection
   struct connection_parameters* other_params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, other_conn);
@@ -680,15 +689,23 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   }
 
   // if we have seen both FINs, this is the last ACK, delete the map entries
-  if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin) {
+  if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin || tcp->rst) {
     bpf_log_info("Finished communication, deleting map entries");
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &connection);
     if (err < 0) {
       bpf_log_err("Error while deleting the connection");
     }
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_parameters_map, &connection);
+    if (err < 0) {
+      bpf_log_err("Error while deleting the parameters");
+    }
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, other_conn);
     if (err < 0) {
       bpf_log_err("Error while deleting the other connection");
+    }
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_parameters_map, other_conn);
+    if (err < 0) {
+      bpf_log_err("Error while deleting the other parameters");
     }
   }
 
@@ -723,13 +740,13 @@ int redirect_packet_main(struct xdp_md* ctx) {
   struct connection_fingerprint connection;
 
   if (bpf_ntohs(tcp->dest) == MIDDLEWARE_PORT) {
-    bpf_log_notice("Message from Client SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
-                   tcp->fin, tcp->psh);
+    bpf_log_notice("Message from Client SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn,
+                   tcp->ack, tcp->fin, tcp->psh, tcp->rst);
     connection.ip = ip->saddr;
     connection.port = bpf_htons(tcp->source);
   } else {
-    bpf_log_notice("Message from Server SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
-                   tcp->fin, tcp->psh);
+    bpf_log_notice("Message from Server SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn,
+                   tcp->ack, tcp->fin, tcp->psh, tcp->rst);
     connection.ip = ip->saddr;
     connection.port = bpf_ntohs(tcp->dest);
   }
@@ -895,11 +912,11 @@ int block_fins_main(struct __sk_buff* skb) {
   }
 
   if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
-    bpf_log_notice("Message to Client SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
-                   tcp->fin, tcp->psh);
+    bpf_log_notice("Message to Client SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh, tcp->rst);
   } else {
-    bpf_log_notice("Message to Server SYN: %d ACK: %d FIN: %d PSH: %d", tcp->syn, tcp->ack,
-                   tcp->fin, tcp->psh);
+    bpf_log_notice("Message to Server SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh, tcp->rst);
   }
 
   // reply with a fake FIN
