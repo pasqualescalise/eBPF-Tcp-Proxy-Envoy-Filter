@@ -597,6 +597,9 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
   tcp->seq = bpf_htonl(bpf_htonl(params->base_ack_number) + increment.sequence_increment);
   tcp->ack_seq = bpf_htonl(bpf_htonl(params->base_sequence_number) + increment.ack_increment);
 
+  bpf_log_debug("New sequence number: %u New ACK number: %u", bpf_ntohl(tcp->seq),
+                bpf_ntohl(tcp->ack_seq));
+
   // timestamps
   struct tcp_timestamps_option new_timestamps = {.tsval = 0, // XXX: this is not used
                                                  .tsecr = params->timestamps.tsval};
@@ -640,7 +643,7 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   // + for the Client, it's the ACK of the handshake (get the base ack number
   //   we missed in add_new_connection), so it must be passed
   // + for the Server, it's the ACK of the first Client packet; its connection has already been
-  // closed, so this ACK must be dropped
+  //   closed, so this ACK must be dropped
   if (tcp->ack && !tcp->psh && params->packet_counter == 2) {
     if (params->base_ack_number == 0) {
       params->base_ack_number = bpf_ntohl(bpf_ntohl(tcp->ack_seq) - 1);
@@ -750,6 +753,10 @@ int redirect_packet_main(struct xdp_md* ctx) {
     connection.ip = ip->saddr;
     connection.port = bpf_ntohs(tcp->dest);
   }
+
+  unsigned int tcp_len = data_end - (void*)tcp - tcp_hdr_size;
+  bpf_log_debug("Sequence number: %u ACK number: %u TCP Len: %u", bpf_ntohl(tcp->seq),
+                bpf_ntohl(tcp->ack_seq), tcp_len);
 
   bpf_log_info("IP: %u, Port: %u", connection.ip, connection.port);
 
@@ -918,6 +925,7 @@ int block_fins_main(struct __sk_buff* skb) {
     bpf_log_notice("Message to Server SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn, tcp->ack,
                    tcp->fin, tcp->psh, tcp->rst);
   }
+  bpf_log_debug("Sequence number: %u ACK number: %u", bpf_ntohl(tcp->seq), bpf_ntohl(tcp->ack_seq));
 
   // reply with a fake FIN
   if (tcp->fin) {
