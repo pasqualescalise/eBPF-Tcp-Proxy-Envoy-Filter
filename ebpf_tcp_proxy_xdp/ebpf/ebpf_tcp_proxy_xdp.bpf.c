@@ -9,6 +9,8 @@
 #include <linux/tcp.h>
 #include <linux/pkt_cls.h>
 
+#include "ebpf/ebpf_tcp_proxy_log.h"
+
 #define MIDDLEWARE_PORT 4444
 #define MAX_TCP_SIZE 1480 // XXX: huge approximation but it works
 #define MAX_ENTRIES_MAP 65536
@@ -161,27 +163,27 @@ static __always_inline int parse_headers(void* data, void* data_end, struct ethh
   __u16 eth_type = parse_ethhdr(data, data_end, &nf_off, eth);
 
   if (data + sizeof(struct ethhdr) > data_end) {
-    // bpf_printk("Packet is not a valid Ethernet packet, dropping it");
+    bpf_log_err("Packet is not a valid Ethernet packet, dropping it");
     return -1;
   }
 
   /* LAYER 3: IP */
 
   if (eth_type != bpf_ntohs(ETH_P_IP)) {
-    // bpf_printk("Packet is not IPv4, passing it");
+    bpf_log_warning("Packet is not IPv4, passing it");
     return -1;
   }
 
   hdr_size = parse_iphdr(data, data_end, &nf_off, ip);
   if (hdr_size < 0) {
-    // bpf_printk("Packet is not a valid IPv4 packet, dropping it");
+    bpf_log_warning("Packet is not a valid IPv4 packet, dropping it");
     return -1;
   }
 
   /* LAYER 4: TCP */
 
   if ((*ip)->protocol != IPPROTO_TCP) {
-    // bpf_printk("Packet is not TCP, passing it");
+    bpf_log_warning("Packet is not TCP, passing it");
     return -1;
   }
 
@@ -189,7 +191,7 @@ static __always_inline int parse_headers(void* data, void* data_end, struct ethh
 
   hdr_size = parse_tcphdr(data, data_end, &nf_off, tcp);
   if (hdr_size < 0) {
-    // bpf_printk("Packet is not a valid TCP packet, dropping it");
+    bpf_log_warning("Packet is not a valid TCP packet, dropping it");
     return -1;
   }
 
@@ -199,6 +201,85 @@ static __always_inline int parse_headers(void* data, void* data_end, struct ethh
 }
 
 /* TCP Timestamps */
+static __always_inline void calculate_timestamps(unsigned int* tsval, unsigned int* tsecr,
+                                                 struct tcp_timestamps_option* this_timestamps,
+                                                 struct tcp_timestamps_option* other_timestamps,
+                                                 int swap_timestamps, int active_connection) {
+  // bpf_printk("Swap timestamps: %d Active connection: %d Other timestamps: %p", swap_timestamps,
+  // active_connection, other_timestamps);
+
+  // extract the timestamps
+  unsigned int extracted_tsval = *tsval;
+  unsigned int extracted_tsecr = *tsecr;
+  // bpf_printk("Extracted TSval: %u Extracted TSecr: %u", bpf_htonl(extracted_tsval),
+  // bpf_htonl(extracted_tsecr));
+
+  // swap the timestamps in the fake FINs
+  if (swap_timestamps) {
+    *tsval = extracted_tsecr;
+    *tsecr = extracted_tsval;
+    // bpf_printk("This packet new TSval: %u This packet new TSecr: %u", bpf_htonl(*tsval),
+    // bpf_htonl(*tsecr));
+    return;
+  }
+
+  // update the timestamps the other connection using the ones of this connection
+  if (other_timestamps != NULL) {
+    // bpf_printk("This old TSval: %u This old TSecr: %u", bpf_htonl(this_timestamps->tsval),
+    // bpf_htonl(this_timestamps->tsecr));
+
+    // how much has the timestamp increased
+    unsigned int increase = 0;
+    if (active_connection) {
+      increase = bpf_htonl(extracted_tsval) - bpf_htonl(this_timestamps->tsecr);
+    } else {
+      increase = bpf_htonl(extracted_tsval) - bpf_htonl(this_timestamps->tsval);
+    }
+    // bpf_printk("Increase: %u", increase);
+
+    // save the timestamps of this connection
+    // TODO: check this
+
+    // save the new timestamps
+    // bpf_printk("Other old TSval: %u Other old TSecr: %u", bpf_htonl(other_timestamps->tsval),
+    // bpf_htonl(other_timestamps->tsecr));
+    if (active_connection) {
+      this_timestamps->tsecr = extracted_tsval;
+      other_timestamps->tsval = bpf_htonl(bpf_htonl(other_timestamps->tsval) + increase);
+    } else {
+      this_timestamps->tsval = extracted_tsval;
+      other_timestamps->tsecr = bpf_htonl(bpf_htonl(other_timestamps->tsecr) + increase);
+    }
+    // bpf_printk("Other new TSval: %u Other new TSecr: %u", bpf_htonl(other_timestamps->tsval),
+    // bpf_htonl(other_timestamps->tsecr));
+
+    // set the packet timestamps
+    if (active_connection) {
+      *tsval = other_timestamps->tsecr;
+      *tsecr = other_timestamps->tsval;
+    } else {
+      *tsval = other_timestamps->tsval;
+      *tsecr = other_timestamps->tsecr;
+    }
+    // bpf_printk("This packet new TSval: %u This packet new TSecr: %u", bpf_htonl(*tsval),
+    // bpf_htonl(*tsecr));
+    return;
+  }
+
+  // save the timestamps without actually swapping them
+  if (active_connection) {
+    this_timestamps->tsval = extracted_tsecr;
+    this_timestamps->tsecr = extracted_tsval;
+    // bpf_printk("Active Saving TSval: %u Saving TSecr: %u", bpf_htonl(this_timestamps->tsval),
+    // bpf_htonl(this_timestamps->tsecr));
+  } else {
+    this_timestamps->tsval = extracted_tsval;
+    this_timestamps->tsecr = extracted_tsecr;
+    // bpf_printk("Passive Saving TSval: %u Saving TSecr: %u", bpf_htonl(this_timestamps->tsval),
+    // bpf_htonl(this_timestamps->tsecr));
+  }
+}
+
 struct tcp_timestamps_ctx {
   void* data;
   void* data_end;
@@ -208,11 +289,13 @@ struct tcp_timestamps_ctx {
   // how many cycles to skip
   int skip;
 
-  struct tcp_timestamps_option* extracted_timestamps;
-  struct tcp_timestamps_option* new_timestamps;
+  struct tcp_timestamps_option* this_timestamps;
+  struct tcp_timestamps_option* other_timestamps;
 
   // 1 if we only need to increment the current timestamps
-  int increment_timestamps;
+  int swap_timestamps;
+
+  int active_connection;
 };
 
 /**
@@ -229,7 +312,7 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
   __u8* data = (__u8*)(long)ctx->data;
   __u8* data_end = (__u8*)(long)ctx->data_end;
 
-  // bpf_printk("Skip: %d", ctx->skip);
+  bpf_log_debug("Skip: %d", ctx->skip);
   if (ctx->skip > 0) {
     ctx->skip--;
     return 0;
@@ -245,7 +328,7 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
     return 1;
   }
 
-  // bpf_printk("Type: %d", *option_type);
+  bpf_log_debug("Type: %d", *option_type);
 
   // No-Operation option
   if (*option_type == 0x01) {
@@ -260,7 +343,7 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
       return 1;
     }
 
-    // bpf_printk("Len: %d", *option_len);
+    bpf_log_debug("Len: %d", *option_len);
     // loop until the option is finished
     ctx->skip = *option_len - 1;
     return 0;
@@ -279,18 +362,8 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
     return 1;
   }
 
-  // extract
-  ctx->extracted_timestamps->tsval = *tsval;
-  ctx->extracted_timestamps->tsecr = *tsecr;
-
-  // update
-  if (ctx->new_timestamps != NULL) {
-    *tsval = ctx->extracted_timestamps->tsecr;
-    *tsecr = ctx->new_timestamps->tsecr;
-  } else if (ctx->increment_timestamps) {
-    *tsval = ctx->extracted_timestamps->tsecr + 1;
-    *tsecr = ctx->extracted_timestamps->tsval;
-  }
+  calculate_timestamps(tsval, tsecr, ctx->this_timestamps, ctx->other_timestamps,
+                       ctx->swap_timestamps, ctx->active_connection);
 
   return 1;
 }
@@ -303,8 +376,8 @@ static long extract_and_update_tcp_timestamps_loop(unsigned int index, void* _ct
  */
 static int fast_extract_and_update_tcp_timestamps_option(
     void* data, void* data_end, __u16 tcp_start, int tcp_hdr_size,
-    struct tcp_timestamps_option* extracted_timestamps,
-    struct tcp_timestamps_option* new_timestamps, int increment_timestamps) {
+    struct tcp_timestamps_option* this_timestamps, struct tcp_timestamps_option* other_timestamps,
+    int swap_timestamps, int active_connection) {
   __u16 tcp_options_start_offset = (tcp_start + sizeof(struct tcphdr)) & 0x7FFF;
 
   unsigned char* noop1 = data + tcp_options_start_offset;
@@ -319,7 +392,7 @@ static int fast_extract_and_update_tcp_timestamps_option(
     return -1;
   }
 
-  // bpf_printk("Fast path for TCP options");
+  bpf_log_info("Fast path for TCP options");
 
   unsigned int* tsval = (unsigned int*)(data + tcp_options_start_offset + 4);
 
@@ -333,18 +406,8 @@ static int fast_extract_and_update_tcp_timestamps_option(
     return -1;
   }
 
-  // extract
-  extracted_timestamps->tsval = *tsval;
-  extracted_timestamps->tsecr = *tsecr;
-
-  // update
-  if (new_timestamps != NULL) {
-    *tsval = extracted_timestamps->tsecr;
-    *tsecr = new_timestamps->tsecr;
-  } else if (increment_timestamps) {
-    *tsval = extracted_timestamps->tsecr + 1;
-    *tsecr = extracted_timestamps->tsval;
-  }
+  calculate_timestamps(tsval, tsecr, this_timestamps, other_timestamps, swap_timestamps,
+                       active_connection);
 
   return 0;
 }
@@ -353,21 +416,23 @@ static int fast_extract_and_update_tcp_timestamps_option(
  * Extract the TCP timestamps and put them in extracted_timestamps; if new_timestamps is not NULL,
  * also update them
  */
-static int extract_and_update_tcp_timestamps_option(
+static __always_inline int extract_and_update_tcp_timestamps_option(
     void* data, void* data_end, __u16 tcp_start, int tcp_hdr_size,
-    struct tcp_timestamps_option* extracted_timestamps,
-    struct tcp_timestamps_option* new_timestamps, int increment_timestamps) {
+    struct tcp_timestamps_option* this_timestamps, struct tcp_timestamps_option* other_timestamps,
+    int swap_timestamps, int active_connection) {
+
+  // FIXME: return 0;
   int err = 0;
 
   // try doing it without the bpf_loop
   err = fast_extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
-                                                      extracted_timestamps, new_timestamps,
-                                                      increment_timestamps);
+                                                      this_timestamps, other_timestamps,
+                                                      swap_timestamps, active_connection);
   if (err == 0) {
     return 0;
   }
 
-  // bpf_printk("Slow path for TCP options - expected for SYN packets");
+  bpf_log_info("Slow path for TCP options - expected for SYN packets");
 
   struct tcp_timestamps_ctx loop_ctx = {.data = data,
                                         .data_end = data_end,
@@ -377,14 +442,16 @@ static int extract_and_update_tcp_timestamps_option(
 
                                         .skip = 0,
 
-                                        .extracted_timestamps = extracted_timestamps,
-                                        .new_timestamps = new_timestamps,
+                                        .this_timestamps = this_timestamps,
+                                        .other_timestamps = other_timestamps,
 
-                                        .increment_timestamps = increment_timestamps};
+                                        .swap_timestamps = swap_timestamps,
+
+                                        .active_connection = active_connection};
 
   int nr = bpf_loop(tcp_hdr_size, (void*)extract_and_update_tcp_timestamps_loop, &loop_ctx, 0);
   if (nr < 0) {
-    // bpf_printk("Error in extract_and_update_tcp_timestamps_loop");
+    bpf_log_err("Error in extract_and_update_tcp_timestamps_loop");
     return nr;
   }
 
@@ -518,8 +585,14 @@ static __always_inline int add_new_connection(void* data, void* data_end, struct
   }
 
   // extract the timestamps
-  err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
-                                                 &(params.timestamps), NULL, 0);
+  if (tcp->syn && tcp->ack) {
+    err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
+                                                   &(params.timestamps), NULL, 0, 1);
+  } else {
+    err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
+                                                   &(params.timestamps), NULL, 0, 0);
+  }
+
   if (err < 0) {
     return err;
   }
@@ -547,15 +620,15 @@ static __always_inline int handle_new_connection(void* data, void* data_end, str
   int err;
 
   if (tcp->syn != 1) {
-    // bpf_printk("Unexpected packet");
+    bpf_log_err("Unexpected packet");
     return -1;
   }
 
-  // bpf_printk("New connection");
+  bpf_log_notice("New connection");
 
   err = add_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, new_connection);
   if (err < 0) {
-    // bpf_printk("Error while adding new connection");
+    bpf_log_err("Error while adding new connection");
     return err;
   }
 
@@ -574,7 +647,8 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
                                          struct iphdr* ip, struct tcphdr* tcp, __u16 tcp_start,
                                          int tcp_hdr_size, struct connection_parameters* params,
                                          struct tcp_timestamps_option* extracted_timestamps,
-                                         struct tcp_sequence_ack_numbers_increment increment) {
+                                         struct tcp_sequence_ack_numbers_increment increment,
+                                         int active_connection) {
   int err;
 
   // Ethernet
@@ -595,14 +669,15 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
   tcp->seq = bpf_htonl(bpf_htonl(params->base_ack_number) + increment.sequence_increment);
   tcp->ack_seq = bpf_htonl(bpf_htonl(params->base_sequence_number) + increment.ack_increment);
 
-  // timestamps
-  struct tcp_timestamps_option new_timestamps = {.tsval = 0, // XXX: this is not used
-                                                 .tsecr = params->timestamps.tsval};
+  bpf_log_debug("New sequence number: %u New ACK number: %u", bpf_ntohl(tcp->seq),
+                bpf_ntohl(tcp->ack_seq));
 
+  // timestamps
   err = extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
-                                                 extracted_timestamps, &new_timestamps, 0);
+                                                 extracted_timestamps, &params->timestamps, 0,
+                                                 active_connection);
   if (err < 0) {
-    // bpf_printk("Error while updating the TCP Timestamps option");
+    bpf_log_err("Error while updating the TCP Timestamps option");
     return err;
   }
 
@@ -617,27 +692,40 @@ static __always_inline int update_packet(void* data, void* data_end, struct ethh
  *
  * Returns 0 on success, 1 if the packet needs to be passed or a negative number on error
  */
-static __always_inline int handle_existing_connection(void* data, void* data_end,
-                                                      struct ethhdr* eth, struct iphdr* ip,
-                                                      struct tcphdr* tcp, __u16 tcp_start,
-                                                      int tcp_hdr_size,
-                                                      struct connection_fingerprint connection,
-                                                      struct connection_parameters* params) {
+static __always_inline int
+handle_existing_connection(void* data, void* data_end, struct ethhdr* eth, struct iphdr* ip,
+                           struct tcphdr* tcp, __u16 tcp_start, int tcp_hdr_size,
+                           struct connection_fingerprint connection,
+                           struct connection_parameters* params, int active_connection) {
   int err = 0;
+
+  // this should never happen
+  // TODO: check if we should do something to parameters if this happens
+  if (tcp->syn) {
+    bpf_log_err("Received SYN while handling existing connection");
+    return -1;
+  }
 
   params->packet_counter++;
 
-  // on both connections, the second ACK packet must be skipped:
+  // on both connections, the second ACK packet is important:
   // + for the Client, it's the ACK of the handshake (get the base ack number
-  //   we missed in add_new_connection)
-  // + for the Server, it's the ACK of the first Client packet
+  //   we missed in add_new_connection), so it must be passed
+  // + for the Server, it's the ACK of the first Client packet; its connection has already been
+  //   closed, so this ACK must be dropped
   if (tcp->ack && !tcp->psh && params->packet_counter == 2) {
     if (params->base_ack_number == 0) {
       params->base_ack_number = bpf_ntohl(bpf_ntohl(tcp->ack_seq) - 1);
+      extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
+                                               &params->timestamps, NULL, 0, 0);
+      bpf_log_notice("Passing this ACK");
+      return XDP_PASS;
+    } else {
+      extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
+                                               &params->timestamps, NULL, 0, 1);
+      bpf_log_notice("Dropping this ACK");
+      return XDP_DROP;
     }
-
-    // bpf_printk("Passing this ack");
-    return 1;
   }
 
   // get the increment of the sequence numbers
@@ -649,39 +737,51 @@ static __always_inline int handle_existing_connection(void* data, void* data_end
   struct connection_fingerprint* other_conn = (struct connection_fingerprint*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_fingerprint_map, &connection);
   if (other_conn == NULL) {
-    // bpf_printk("No mapping (expected for the first PUSH/ACK)");
+    bpf_log_warning("No mapping (expected for the first PUSH/ACK)");
     return -1;
   }
+
+  bpf_log_info("OtherIP: %u, OtherPort: %u", other_conn->ip, other_conn->port);
 
   // get the parameters of the other connection
   struct connection_parameters* other_params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, other_conn);
   if (other_params == NULL) {
-    // bpf_printk("No reverse");
+    bpf_log_warning("No reverse");
     return -1;
   }
 
   // prepare the packet headers to redirect it
   err = update_packet(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, other_params,
-                      &params->timestamps, increment);
+                      &params->timestamps, increment, active_connection);
   if (err < 0) {
-    // bpf_printk("Error while updating the packet");
+    bpf_log_err("Error while updating the packet");
     return err;
   }
 
   if (tcp->fin) {
+    bpf_log_info("Seen FIN packet");
     params->seen_fin = 1;
   }
 
   // if we have seen both FINs, this is the last ACK, delete the map entries
-  if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin) {
+  if (!tcp->fin && tcp->ack && params->seen_fin && other_params->seen_fin || tcp->rst) {
+    bpf_log_info("Finished communication, deleting map entries");
     err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &connection);
     if (err < 0) {
-      // bpf_printk("Error while deleting the connection");
+      bpf_log_err("Error while deleting the connection");
     }
-    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, &other_conn);
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_parameters_map, &connection);
     if (err < 0) {
-      // bpf_printk("Error while deleting the other connection");
+      bpf_log_err("Error while deleting the parameters");
+    }
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_fingerprint_map, other_conn);
+    if (err < 0) {
+      bpf_log_err("Error while deleting the other connection");
+    }
+    err = bpf_map_delete_elem(&connection_fingerprint_to_connection_parameters_map, other_conn);
+    if (err < 0) {
+      bpf_log_err("Error while deleting the other parameters");
     }
   }
 
@@ -708,24 +808,33 @@ int redirect_packet_main(struct xdp_md* ctx) {
   // get the Ethernet, IP and TCP headers
   err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
   if (err < 0) {
-    // bpf_printk("Failed to parse headers for XDP");
+    bpf_log_err("Failed to parse headers for XDP");
     goto pass;
   }
 
   // get connection type
   struct connection_fingerprint connection;
+  int active_connection = 0;
 
   if (bpf_ntohs(tcp->dest) == MIDDLEWARE_PORT) {
-    // bpf_printk("Message from Client");
+    bpf_log_notice("Message from Client SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn,
+                   tcp->ack, tcp->fin, tcp->psh, tcp->rst);
     connection.ip = ip->saddr;
     connection.port = bpf_htons(tcp->source);
+    active_connection = 0;
   } else {
-    // bpf_printk("Message from Server");
+    bpf_log_notice("Message from Server SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn,
+                   tcp->ack, tcp->fin, tcp->psh, tcp->rst);
     connection.ip = ip->saddr;
     connection.port = bpf_ntohs(tcp->dest);
+    active_connection = 1;
   }
 
-  // bpf_printk("IP: %u, Port: %u", connection.ip, connection.port);
+  unsigned int tcp_len = data_end - (void*)tcp - tcp_hdr_size;
+  bpf_log_debug("Sequence number: %u ACK number: %u TCP Len: %u", bpf_ntohl(tcp->seq),
+                bpf_ntohl(tcp->ack_seq), tcp_len);
+
+  bpf_log_info("IP: %u, Port: %u", connection.ip, connection.port);
 
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
@@ -734,7 +843,7 @@ int redirect_packet_main(struct xdp_md* ctx) {
   if (params == NULL) {
     err = handle_new_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size, &connection);
     if (err < 0) {
-      // bpf_printk("Error while handling new connection");
+      bpf_log_err("Error while handling new connection");
     }
 
     goto pass;
@@ -742,29 +851,33 @@ int redirect_packet_main(struct xdp_md* ctx) {
 
   // existing connection
   err = handle_existing_connection(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size,
-                                   connection, params);
+                                   connection, params, active_connection);
   if (err < 0) {
-    // bpf_printk("Error while handling existing connection");
+    bpf_log_err("Error while handling existing connection");
     goto pass;
-  } else if (err == 1) {
+  } else if (err == XDP_PASS) {
     goto pass;
+  } else if (err == XDP_DROP) {
+    goto drop;
   }
-
-  // bpf_printk("Redirecting");
-  // bpf_printk("");
 
   // redirect the packet
   long red = bpf_redirect_array(0);
   if (red != XDP_REDIRECT) {
+    bpf_log_err("Failed to redirect XDP, passing");
     goto pass;
   }
 
+  bpf_log_notice("Redirecting XDP\n");
   return XDP_REDIRECT;
 
 pass:
-  // bpf_printk("Passing");
-  // bpf_printk("");
+  bpf_log_notice("Passing XDP\n");
   return XDP_PASS;
+
+drop:
+  bpf_log_notice("Dropping XDP\n");
+  return XDP_DROP;
 }
 
 /* TC - BLOCK FINS */
@@ -806,7 +919,7 @@ static __always_inline int reply_fin_back(void* data, void* data_end, struct eth
   // swap timestamps, while incrementing
   struct tcp_timestamps_option timestamps;
   extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size, &timestamps,
-                                           NULL, 1);
+                                           NULL, 1, 1);
 
   // update checksum
   update_ip_checksum(ip);
@@ -814,43 +927,49 @@ static __always_inline int reply_fin_back(void* data, void* data_end, struct eth
 
   long red = bpf_redirect_array(BPF_F_INGRESS);
   if (red != TC_ACT_REDIRECT) {
+    bpf_log_err("Failed to redirect TC, passing\n");
     return TC_ACT_OK;
   }
 
+  bpf_log_notice("Redirected TC\n");
   return TC_ACT_REDIRECT;
 }
 
 /**
  * Drop the last ACK, using the connection parameters set by XDP
  */
-static __always_inline int block_last_ack(struct iphdr* ip, struct tcphdr* tcp) {
+static __always_inline int block_last_ack(void* data, void* data_end, struct iphdr* ip,
+                                          struct tcphdr* tcp, __u16 tcp_start, int tcp_hdr_size) {
   // get connection type
   struct connection_fingerprint connection;
 
+  int active_connection = 0;
   if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
-    // bpf_printk("Message to Client");
     connection.ip = ip->daddr;
     connection.port = bpf_htons(tcp->dest);
+    active_connection = 1;
   } else {
-    // bpf_printk("Message to Server");
     connection.ip = ip->daddr;
     connection.port = bpf_ntohs(tcp->source);
+    active_connection = 0;
   }
 
-  // bpf_printk("IP: %u, Port: %u", connection.ip, connection.port);
+  bpf_log_info("IP: %u, Port: %u", connection.ip, connection.port);
 
   // get the parameters of the connection
   struct connection_parameters* params = (struct connection_parameters*)bpf_map_lookup_elem(
       &connection_fingerprint_to_connection_parameters_map, &connection);
 
   if (params == NULL) {
-    // bpf_printk("Error");
-    // bpf_printk("");
+    bpf_log_err("Error while looking up parameters");
     return -1;
   }
 
   params->tc_ack_counter += 1;
   if (params->tc_ack_counter == 1) {
+    extract_and_update_tcp_timestamps_option(data, data_end, tcp_start, tcp_hdr_size,
+                                             &params->timestamps, NULL, 0, active_connection);
+
     return -1;
   }
 
@@ -878,32 +997,37 @@ int block_fins_main(struct __sk_buff* skb) {
   // get the Ethernet, IP and TCP headers
   err = parse_headers(data, data_end, &eth, &ip, &tcp, &tcp_start, &tcp_hdr_size);
   if (err < 0) {
-    // bpf_printk("Failed to parse headers for TC");
+    bpf_log_err("Failed to parse headers for TC");
     goto pass;
   }
 
+  if (bpf_ntohs(tcp->source) == MIDDLEWARE_PORT) {
+    bpf_log_notice("Message to Client SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh, tcp->rst);
+  } else {
+    bpf_log_notice("Message to Server SYN: %d ACK: %d FIN: %d PSH: %d RST: %d", tcp->syn, tcp->ack,
+                   tcp->fin, tcp->psh, tcp->rst);
+  }
+  bpf_log_debug("Sequence number: %u ACK number: %u", bpf_ntohl(tcp->seq), bpf_ntohl(tcp->ack_seq));
+
   // reply with a fake FIN
   if (tcp->fin) {
-    // bpf_printk("Redirecting");
-    // bpf_printk("");
     return reply_fin_back(data, data_end, eth, ip, tcp, tcp_start, tcp_hdr_size);
   }
 
   // we need to block the last single ACK
   if (tcp->ack && !tcp->syn && !tcp->psh) {
-    err = block_last_ack(ip, tcp);
+    err = block_last_ack(data, data_end, ip, tcp, tcp_start, tcp_hdr_size);
     if (err < 0) {
       goto pass;
     }
 
-    // bpf_printk("Dropping");
-    // bpf_printk("");
+    bpf_log_notice("Dropping last ACK\n");
     return TC_ACT_SHOT;
   }
 
 pass:
-  // bpf_printk("Passing");
-  // bpf_printk("");
+  bpf_log_notice("Passing TC\n");
   return TC_ACT_OK;
 }
 

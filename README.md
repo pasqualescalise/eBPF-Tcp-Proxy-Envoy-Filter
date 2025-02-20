@@ -7,7 +7,7 @@ This envoy filters extend the [TCP Proxy](https://www.envoyproxy.io/docs/envoy/l
 
 This repo is based on the [Envoy filter example](https://github.com/envoyproxy/envoy-filter-example)
 
-This was tested with [Envoy v1.30.4](https://github.com/envoyproxy/envoy/releases/tag/v1.30.4)
+This was tested with [Envoy v1.32.0](https://github.com/envoyproxy/envoy/releases/tag/v1.32.0)
 
 ## Dependencies
 

@@ -1,5 +1,8 @@
-#include "ebpf_tcp_proxy_xdp/ebpf/ebpf_tcp_proxy_xdp.skel.h"
 #include "ebpf_tcp_proxy_xdp.h"
+
+extern "C" {
+#include "ebpf_tcp_proxy_xdp/ebpf/ebpf_tcp_proxy_xdp.skel.h"
+}
 
 namespace Envoy {
 namespace Extensions {
@@ -41,6 +44,7 @@ private:
   };
 
   // even if multiple filters are configured, just load the programs once
+  // XXX: we assume only one interface wants to be configured
   static bool ebpf_loaded;
 
   static void attachXDP(struct bpf_object_skeleton* skel, int interface_index);

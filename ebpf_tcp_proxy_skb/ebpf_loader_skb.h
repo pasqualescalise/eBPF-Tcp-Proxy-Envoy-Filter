@@ -1,5 +1,8 @@
-#include "ebpf_tcp_proxy_skb/ebpf/ebpf_tcp_proxy_skb.skel.h"
 #include "ebpf_tcp_proxy_skb.h"
+
+extern "C" {
+#include "ebpf_tcp_proxy_skb/ebpf/ebpf_tcp_proxy_skb.skel.h"
+}
 
 namespace Envoy {
 namespace Extensions {
@@ -37,7 +40,8 @@ private:
   // description of all the programs
   static constexpr const ProgramDescription progs[] = {
       {"sockops/add_to_sockhash", BPF_PROG_TYPE_SOCK_OPS, PROG_SOCKOPS_ADD_TO_SOCKHASH, NULL},
-      {"sk_skb_verdict/redirect_socket", BPF_PROG_TYPE_SK_SKB, PROG_SK_SKB_VERDICT_REDIRECT_SOCKET, NULL},
+      {"sk_skb_verdict/redirect_socket", BPF_PROG_TYPE_SK_SKB, PROG_SK_SKB_VERDICT_REDIRECT_SOCKET,
+       NULL},
   };
 
   // even if multiple filters are configured, just load the programs once
