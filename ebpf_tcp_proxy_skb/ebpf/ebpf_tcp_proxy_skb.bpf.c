@@ -97,8 +97,8 @@ int add_to_sockhash_main(struct bpf_sock_ops* ops) {
 /**
  * Redirect the Client socket on the Server one and viceversa
  */
-SEC("sk_skb_verdict/redirect_packet")
-int redirect_packet_main(struct __sk_buff* skb) {
+SEC("sk_skb_verdict/redirect_socket")
+int redirect_socket_main(struct __sk_buff* skb) {
   int err;
 
   struct connection_fingerprint connection;
