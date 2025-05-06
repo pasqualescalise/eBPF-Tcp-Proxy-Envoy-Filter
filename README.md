@@ -19,7 +19,7 @@ The eBPF programs inject themselves in the kernel, stopping packets to traverse 
 
 There are two different implementations, one working at the XDP level (working with raw TCP packets) and one at the SK\_SKB level (working at the stream/socket level). Their behaviour is basically the same:
 
-![Interaction Diagram of eBPF TCP Proxy](images/Interaction_simplified_eBPF.pdf)
+![Interaction Diagram of eBPF TCP Proxy](images/Interaction_simplified_eBPF.png)
 
 At the XDP level, raw packet headers have their own fields changed and sent back; the whole socket abstraction is skipped, while still mantaining TCP semantics.
 
