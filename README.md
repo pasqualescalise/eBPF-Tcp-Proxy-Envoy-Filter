@@ -9,6 +9,22 @@ This repo is based on the [Envoy filter example](https://github.com/envoyproxy/e
 
 This was tested with [Envoy v1.32.0](https://github.com/envoyproxy/envoy/releases/tag/v1.32.0)
 
+## How it works
+
+### This code is part of my master thesis called [Accelerating L4 Middleboxes in the Linux kernel](https://www.politesi.polimi.it)
+
+This program is meant as a drop-in replacement to the TCP Proxy Envoy filter; it should be run on a Middlebox that relays all TCP packets, encrypted with TLS, from one Client machine to a Server one and viceversa.
+
+The eBPF programs inject themselves in the kernel, stopping packets to traverse higher up the kernel networking stack and instead they handle them immediately. This way, packets can be read, transformed and sent out without ever needing to go to userspace.
+
+There are two different implementations, one working at the XDP level (working with raw TCP packets) and one at the SK\_SKB level (working at the stream/socket level). Their behaviour is basically the same:
+
+![Interaction Diagram of eBPF TCP Proxy](images/Interaction_simplified_eBPF.pdf)
+
+At the XDP level, raw packet headers have their own fields changed and sent back; the whole socket abstraction is skipped, while still mantaining TCP semantics.
+
+To know more details, read my thesis on [politesi](https://www.politesi.polimi.it)
+
 ## Dependencies
 
 + Linux kernel >= 6.1
@@ -88,7 +104,3 @@ On the client, run `wrk https://kafkax.server.test:<middleware-port>`
 * [bombardier](https://github.com/codesenberg/bombardier)
 
 On the client, run `bombardier http://kafkax.server.test:<middleware-port>`
-
-## How it works
-
-TODO
