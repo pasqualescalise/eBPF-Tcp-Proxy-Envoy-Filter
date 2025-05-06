@@ -63,7 +63,9 @@ These three configuration files can be used to test the EBPF Tcp Proxy filters a
 
 ## Benchmarking and testing
 
-* [iperf-ssl](https://github.com/TrekkieCoder/iperf-ssl)
+### Stress testing
+
+NOTE: since we assume SSL, we use [iperf-ssl](https://github.com/TrekkieCoder/iperf-ssl) instead of standard iperf
 
 On the server, run `iperf --tls=v1.2 -s -p <server-port>`
 
